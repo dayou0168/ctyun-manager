@@ -47,10 +47,23 @@ http://127.0.0.1:8000/
 
 ## 部署方式一：Linux 服务器直装
 
-适合直接部署到 Ubuntu/Debian 服务器。脚本会自动更新系统包、安装 Python、Playwright/Chromium、Xvfb、x11vnc、fluxbox、字体等依赖，并创建 systemd 服务 `ctyun-manager`。
+适合直接部署到 Ubuntu/Debian 服务器。服务器只需要执行一条 curl 命令，脚本会自动下载项目到 `/opt/ctyun-manager`，更新系统包，安装 Python、Playwright/Chromium、Xvfb、x11vnc、fluxbox、字体等依赖，并创建 systemd 服务 `ctyun-manager`。
+
+仓库公开时可直接执行：
 
 ```bash
-sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-linux.sh | sudo bash
+```
+
+当前仓库为 Private 时，需要先准备一个有 `repo` 权限的 GitHub Token：
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+curl -fsSL \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/dayou0168/ctyun-manager/contents/install-linux.sh \
+  | sudo GITHUB_TOKEN="$GITHUB_TOKEN" bash
 ```
 
 默认访问地址：
@@ -69,21 +82,42 @@ journalctl -u ctyun-manager -f
 如果不希望脚本执行系统包升级，可以这样运行：
 
 ```bash
-sudo CTYUN_MANAGER_SKIP_SYSTEM_UPGRADE=1 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-linux.sh \
+  | sudo CTYUN_MANAGER_SKIP_SYSTEM_UPGRADE=1 bash
 ```
 
 如果 8000 端口被占用，可以指定端口：
 
 ```bash
-sudo CTYUN_MANAGER_PORT=8080 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-linux.sh \
+  | sudo CTYUN_MANAGER_PORT=8080 bash
+```
+
+如果已经手动下载了项目源码，也可以在项目目录内执行：
+
+```bash
+sudo ./install.sh
 ```
 
 ## 部署方式二：Docker Compose 一键部署
 
-适合希望隔离运行环境的服务器。脚本会自动安装 Docker Engine 和 Docker Compose 插件，生成 `.env`，构建镜像并启动服务。
+适合希望隔离运行环境的服务器。服务器只需要执行一条 curl 命令，脚本会自动下载项目到 `/opt/ctyun-manager`，安装 Docker Engine 和 Docker Compose 插件，生成 `.env`，构建镜像并启动服务。
+
+仓库公开时可直接执行：
 
 ```bash
-sudo ./install-docker.sh
+curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-compose.sh | sudo bash
+```
+
+当前仓库为 Private 时：
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+curl -fsSL \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/dayou0168/ctyun-manager/contents/install-compose.sh \
+  | sudo GITHUB_TOKEN="$GITHUB_TOKEN" bash
 ```
 
 默认访问地址：
@@ -103,7 +137,8 @@ docker compose restart
 如需换端口：
 
 ```bash
-sudo CTYUN_MANAGER_PORT=8080 ./install-docker.sh
+curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-compose.sh \
+  | sudo CTYUN_MANAGER_PORT=8080 bash
 ```
 
 Docker Compose 模式的数据保存在项目目录的 `data/`，包括 SQLite 数据库和 `master.key`。迁移服务器时必须一起迁移 `data/`，否则已加密的账号密码无法解密。

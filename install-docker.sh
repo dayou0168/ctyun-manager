@@ -72,7 +72,7 @@ install_docker
 create_env_file
 
 cd "$APP_DIR"
-chmod +x install-docker.sh start.sh restart.sh stop.sh install.sh 2>/dev/null || true
+chmod +x install-docker.sh install-compose.sh install-linux.sh start.sh restart.sh stop.sh install.sh 2>/dev/null || true
 
 if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$APP_PORT" 2>/dev/null | grep -q .; then
   if ! $SUDO docker ps --format '{{.Names}}' | grep -qx 'ctyun-manager'; then

@@ -66,7 +66,7 @@ if [ ! -f "$APP_DIR/.env" ]; then
   sed -i "s|^CTYUN_MANAGER_SESSION_SECRET=.*|CTYUN_MANAGER_SESSION_SECRET=$SESSION_SECRET|" "$APP_DIR/.env"
 fi
 
-for script in install.sh install-docker.sh start.sh restart.sh stop.sh; do
+for script in install.sh install-linux.sh install-docker.sh install-compose.sh start.sh restart.sh stop.sh; do
   if [ -f "$APP_DIR/$script" ]; then
     chmod +x "$APP_DIR/$script"
   fi

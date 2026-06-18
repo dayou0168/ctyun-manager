@@ -44,11 +44,13 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - AC 管理已按用户要求移除。
   - 多数列表具备编辑入口，英文操作已改为中文。
 - 本地版本：
-  - 当前构建：`2026.06.19.0144`
+  - 当前构建：`2026.06.19.0156`
   - 本地验证地址：`http://127.0.0.1:8000/`
 - 部署方式：
-  - Linux 服务器直装：`sudo ./install.sh`
-  - Docker Compose 一键部署：`sudo ./install-docker.sh`
+  - Linux 服务器直装远程入口：`install-linux.sh`
+  - Docker Compose 远程入口：`install-compose.sh`
+  - 本地源码直装：`sudo ./install.sh`
+  - 本地源码 Docker Compose：`sudo ./install-docker.sh`
   - 两种方式默认端口都是 `8000`，可通过 `CTYUN_MANAGER_PORT=8080` 改端口。
 
 ## 关键文件结构
@@ -74,8 +76,10 @@ app/
 API_REFERENCE.md                  内部接口记录
 PROJECT_CONTEXT.md                Codex 续接上下文
 README.md                         项目说明
-install.sh/start.sh/restart.sh    Linux 部署脚本
-install-docker.sh                 Docker Compose 一键部署脚本
+install-linux.sh                  GitHub curl 直装入口
+install-compose.sh                GitHub curl Docker Compose 入口
+install.sh/start.sh/restart.sh    本地源码 Linux 部署脚本
+install-docker.sh                 本地源码 Docker Compose 部署脚本
 Dockerfile/docker-compose.yml      Docker Compose 部署文件
 requirements.txt                  Python 依赖
 ```
@@ -94,13 +98,15 @@ requirements.txt                  Python 依赖
 - 支付状态以官方 `/unifyapi/upayquery` 为准。
 - 快速下单路径曾出现官方重定向回充值页，因此必须验证收银台控件真实出现，不能只看 URL。
 - 包内和 GitHub 仓库禁止包含数据库、密钥、浏览器状态、日志。
+- 用户想要的 Linux 一键脚本是直接 curl GitHub 上的 `.sh`，然后自动下载项目并完成安装；主入口为 `install-linux.sh`。
+- GitHub 仓库当前是 Private，免 token 的 `raw.githubusercontent.com` curl 命令需要仓库改 Public；Private 状态下需要用 `GITHUB_TOKEN` 通过 GitHub API 读取脚本和源码包。
 - 直装方式使用 systemd 运行 `start.sh`，脚本负责启动 Xvfb、fluxbox、x11vnc 和 FastAPI。
 - Docker Compose 方式使用本地 `data/` 挂载到容器 `/app/data`，迁移时必须保留 `data/master.key` 和 SQLite 数据库。
 
 ## 当前待办
 
 - 公网 `http://43.119.30.80:8000/` 需要部署最新包后才会更新。
-  - 最近一次本地版本：`2026.06.19.0144`
+  - 最近一次本地版本：`2026.06.19.0156`
   - 之前公网曾停留在旧版本，部署后应先检查 `/api/version`。
 - 继续实测支付成功后：
   - 平台弹窗是否显示成功页。
