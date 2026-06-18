@@ -5,6 +5,8 @@ REPO_OWNER="${CTYUN_MANAGER_REPO_OWNER:-dayou0168}"
 REPO_NAME="${CTYUN_MANAGER_REPO_NAME:-ctyun-manager}"
 REPO_REF="${CTYUN_MANAGER_REPO_REF:-main}"
 INSTALL_DIR="${CTYUN_MANAGER_INSTALL_DIR:-/opt/ctyun-manager}"
+APP_PORT="${CTYUN_MANAGER_PORT:-8000}"
+IMAGE_NAME="${CTYUN_MANAGER_IMAGE:-ghcr.io/$REPO_OWNER/$REPO_NAME:latest}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run this installer as root, for example:"
@@ -24,54 +26,119 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl tar
+install_docker() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    return
+  fi
 
-TMP_DIR="$(mktemp -d)"
-cleanup() {
-  rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
-
-ARCHIVE="$TMP_DIR/source.tar.gz"
-DOWNLOAD_URL="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/tarball/$REPO_REF"
-CURL_ARGS=(-fsSL --retry 3 --connect-timeout 20 -L)
-
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-  CURL_ARGS+=(-H "Authorization: Bearer $GITHUB_TOKEN")
-fi
-
-echo "Downloading $REPO_OWNER/$REPO_NAME@$REPO_REF..."
-if ! curl "${CURL_ARGS[@]}" "$DOWNLOAD_URL" -o "$ARCHIVE"; then
-  echo "Failed to download project archive from GitHub."
-  echo "If the repository is private, pass a token with repo permission:"
-  echo "curl -fsSL -H \"Authorization: Bearer \$GITHUB_TOKEN\" -H \"Accept: application/vnd.github.raw\" \\"
-  echo "  https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/install-compose.sh | sudo GITHUB_TOKEN=\"\$GITHUB_TOKEN\" bash"
-  exit 1
-fi
-
-tar -xzf "$ARCHIVE" -C "$TMP_DIR"
-SRC_DIR="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-if [ -z "$SRC_DIR" ] || [ ! -f "$SRC_DIR/install-docker.sh" ]; then
-  echo "Downloaded archive does not look like a ctyun-manager release."
-  exit 1
-fi
-
-mkdir -p "$INSTALL_DIR"
-for item in "$INSTALL_DIR"/* "$INSTALL_DIR"/.[!.]* "$INSTALL_DIR"/..?*; do
-  [ -e "$item" ] || continue
-  base="$(basename "$item")"
-  case "$base" in
-    .env|data|.playwright|.venv|master.key|*.db|*.db-shm|*.db-wal|*.log|work-*.out.log|work-*.err.log)
-      continue
+  . /etc/os-release
+  case "${ID:-}" in
+    ubuntu|debian) ;;
+    *)
+      echo "Unsupported Linux distribution: ${ID:-unknown}. Please install Docker Engine and the Compose plugin first."
+      exit 1
       ;;
   esac
-  rm -rf "$item"
-done
 
-cp -a "$SRC_DIR"/. "$INSTALL_DIR"/
-chmod +x "$INSTALL_DIR"/*.sh
+  echo "Installing Docker Engine and Docker Compose plugin..."
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg iproute2
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  CODENAME="${VERSION_CODENAME:-}"
+  if [ -z "$CODENAME" ]; then
+    CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-}")"
+  fi
+  if [ -z "$CODENAME" ]; then
+    echo "Could not detect distribution codename for Docker apt repository."
+    exit 1
+  fi
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${CODENAME} stable" \
+    | tee /etc/apt/sources.list.d/docker.list >/dev/null
+  apt-get update
+  apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+download_compose_file() {
+  mkdir -p "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
+
+  RAW_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REPO_REF/docker-compose.deploy.yml"
+  API_URL="https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/docker-compose.deploy.yml?ref=$REPO_REF"
+
+  echo "Downloading docker-compose.deploy.yml..."
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    curl -fsSL --retry 3 --connect-timeout 20 \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.raw" \
+      "$API_URL" \
+      -o docker-compose.deploy.yml
+  else
+    curl -fsSL --retry 3 --connect-timeout 20 -L "$RAW_URL" -o docker-compose.deploy.yml
+  fi
+}
+
+create_env_file() {
+  cd "$INSTALL_DIR"
+  if [ ! -f .env ]; then
+    SESSION_SECRET="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    cat >.env <<EOF
+CTYUN_MANAGER_PORT=$APP_PORT
+CTYUN_MANAGER_IMAGE=$IMAGE_NAME
+CTYUN_MANAGER_ADMIN_USER=admin
+CTYUN_MANAGER_ADMIN_PASSWORD=change-me-now
+CTYUN_MANAGER_SESSION_SECRET=$SESSION_SECRET
+CTYUN_MANAGER_PUBLIC_URL=http://127.0.0.1:$APP_PORT
+CTYUN_BROWSER_HEADFUL=1
+CTYUN_RECHARGE_PREWARM_ENABLED=1
+CTYUN_RECHARGE_FAST_ORDER_ENABLED=1
+CTYUN_RECHARGE_QR_CACHE_ENABLED=1
+EOF
+    chmod 600 .env
+  fi
+}
+
+login_to_registry() {
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$REPO_OWNER" --password-stdin || true
+  fi
+}
+
+check_port() {
+  if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :$APP_PORT" 2>/dev/null | grep -q .; then
+    if ! docker ps --format '{{.Names}}' | grep -qx 'ctyun-manager'; then
+      echo "Port $APP_PORT is already in use by another service. Set CTYUN_MANAGER_PORT=another_port or stop that service."
+      ss -ltnp "sport = :$APP_PORT" || true
+      exit 1
+    fi
+  fi
+}
+
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl iproute2
+
+install_docker
+download_compose_file
+create_env_file
+login_to_registry
+check_port
 
 cd "$INSTALL_DIR"
-echo "Running Docker Compose installer in $INSTALL_DIR..."
-./install-docker.sh
+docker compose -f docker-compose.deploy.yml pull
+docker compose -f docker-compose.deploy.yml up -d
+docker compose -f docker-compose.deploy.yml ps
+
+echo "Installed ctyun-manager with Docker Compose"
+echo "Image: $IMAGE_NAME"
+echo "Compose file: $INSTALL_DIR/docker-compose.deploy.yml"
+echo "URL: http://SERVER_IP:$APP_PORT"
+echo "Initial username: admin"
+echo "Initial password: change-me-now"
+echo "Change CTYUN_MANAGER_ADMIN_PASSWORD in $INSTALL_DIR/.env, then run:"
+echo "  cd $INSTALL_DIR && docker compose -f docker-compose.deploy.yml up -d"
+echo "Logs:"
+echo "  cd $INSTALL_DIR && docker compose -f docker-compose.deploy.yml logs -f"

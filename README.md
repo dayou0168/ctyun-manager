@@ -99,9 +99,20 @@ curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/instal
 sudo ./install.sh
 ```
 
-## 部署方式二：Docker Compose 一键部署
+## 部署方式二：Docker Compose 直接部署
 
-适合希望隔离运行环境的服务器。服务器只需要执行一条 curl 命令，脚本会自动下载项目到 `/opt/ctyun-manager`，安装 Docker Engine 和 Docker Compose 插件，生成 `.env`，构建镜像并启动服务。
+适合希望隔离运行环境的服务器。发布版 Compose 文件 `docker-compose.deploy.yml` 可以直接拉取镜像部署，不需要服务器上有完整源码。
+
+如果服务器已经安装 Docker 和 Docker Compose，可直接下载 yaml 部署：
+
+```bash
+mkdir -p /opt/ctyun-manager
+cd /opt/ctyun-manager
+curl -fsSLO https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/docker-compose.deploy.yml
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+如果服务器还没有 Docker，使用一键脚本安装 Docker、下载 yaml、生成 `.env` 并启动：
 
 仓库公开时可直接执行：
 
@@ -109,7 +120,7 @@ sudo ./install.sh
 curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/install-compose.sh | sudo bash
 ```
 
-当前仓库为 Private 时：
+当前仓库为 Private 时，需要先准备一个有 `repo` 和 `read:packages` 权限的 GitHub Token：
 
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
@@ -118,6 +129,12 @@ curl -fsSL \
   -H "Accept: application/vnd.github.raw" \
   https://api.github.com/repos/dayou0168/ctyun-manager/contents/install-compose.sh \
   | sudo GITHUB_TOKEN="$GITHUB_TOKEN" bash
+```
+
+如果 GHCR 镜像仍是 Private，直接使用 yaml 部署前还需要登录镜像仓库：
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u dayou0168 --password-stdin
 ```
 
 默认访问地址：
@@ -141,7 +158,9 @@ curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/instal
   | sudo CTYUN_MANAGER_PORT=8080 bash
 ```
 
-Docker Compose 模式的数据保存在项目目录的 `data/`，包括 SQLite 数据库和 `master.key`。迁移服务器时必须一起迁移 `data/`，否则已加密的账号密码无法解密。
+`docker-compose.deploy.yml` 模式的数据保存在 Docker 命名卷 `ctyun-manager-data`，包括 SQLite 数据库和 `master.key`。迁移服务器时必须一起备份迁移该 volume，否则已加密的账号密码无法解密。
+
+说明：`docker-compose.deploy.yml` 使用 GHCR 镜像直接部署；`docker-compose.yml` 保留给已经下载源码后的本地构建部署。
 
 ## 首次登录与安全
 

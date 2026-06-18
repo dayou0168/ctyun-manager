@@ -44,11 +44,12 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - AC 管理已按用户要求移除。
   - 多数列表具备编辑入口，英文操作已改为中文。
 - 本地版本：
-  - 当前构建：`2026.06.19.0156`
+  - 当前构建：`2026.06.19.0206`
   - 本地验证地址：`http://127.0.0.1:8000/`
 - 部署方式：
   - Linux 服务器直装远程入口：`install-linux.sh`
   - Docker Compose 远程入口：`install-compose.sh`
+  - Docker Compose 直接部署文件：`docker-compose.deploy.yml`
   - 本地源码直装：`sudo ./install.sh`
   - 本地源码 Docker Compose：`sudo ./install-docker.sh`
   - 两种方式默认端口都是 `8000`，可通过 `CTYUN_MANAGER_PORT=8080` 改端口。
@@ -80,7 +81,9 @@ install-linux.sh                  GitHub curl 直装入口
 install-compose.sh                GitHub curl Docker Compose 入口
 install.sh/start.sh/restart.sh    本地源码 Linux 部署脚本
 install-docker.sh                 本地源码 Docker Compose 部署脚本
-Dockerfile/docker-compose.yml      Docker Compose 部署文件
+Dockerfile/docker-compose.yml      本地源码 Docker Compose 构建文件
+docker-compose.deploy.yml          发布版 Docker Compose 直接部署文件
+.github/workflows/docker-image.yml GHCR 镜像发布 workflow
 requirements.txt                  Python 依赖
 ```
 
@@ -101,12 +104,15 @@ requirements.txt                  Python 依赖
 - 用户想要的 Linux 一键脚本是直接 curl GitHub 上的 `.sh`，然后自动下载项目并完成安装；主入口为 `install-linux.sh`。
 - GitHub 仓库当前是 Private，免 token 的 `raw.githubusercontent.com` curl 命令需要仓库改 Public；Private 状态下需要用 `GITHUB_TOKEN` 通过 GitHub API 读取脚本和源码包。
 - 直装方式使用 systemd 运行 `start.sh`，脚本负责启动 Xvfb、fluxbox、x11vnc 和 FastAPI。
-- Docker Compose 方式使用本地 `data/` 挂载到容器 `/app/data`，迁移时必须保留 `data/master.key` 和 SQLite 数据库。
+- `docker-compose.deploy.yml` 直接拉取 `ghcr.io/dayou0168/ctyun-manager:latest`，不需要服务器有完整源码。
+- GHCR 镜像通过 `.github/workflows/docker-image.yml` 在推送 `main` 后自动构建发布。
+- 发布版 Docker Compose 使用命名卷 `ctyun-manager-data` 持久化 `/app/data`，迁移时必须备份该 volume 内的 `master.key` 和 SQLite 数据库。
+- 本地源码 Docker Compose 仍保留 `docker-compose.yml`，它使用 `build:` 从当前源码构建镜像，并把本地 `./data` 挂载到容器 `/app/data`。
 
 ## 当前待办
 
 - 公网 `http://43.119.30.80:8000/` 需要部署最新包后才会更新。
-  - 最近一次本地版本：`2026.06.19.0156`
+  - 最近一次本地版本：`2026.06.19.0206`
   - 之前公网曾停留在旧版本，部署后应先检查 `/api/version`。
 - 继续实测支付成功后：
   - 平台弹窗是否显示成功页。
