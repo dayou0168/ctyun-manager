@@ -45,27 +45,79 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 http://127.0.0.1:8000/
 ```
 
-## Linux 部署
+## 部署方式一：Linux 服务器直装
 
-项目自带安装脚本：
+适合直接部署到 Ubuntu/Debian 服务器。脚本会自动更新系统包、安装 Python、Playwright/Chromium、Xvfb、x11vnc、fluxbox、字体等依赖，并创建 systemd 服务 `ctyun-manager`。
 
 ```bash
 sudo ./install.sh
 ```
 
-安装脚本会创建 systemd 服务 `ctyun-manager`，并使用 `start.sh` 启动 Xvfb、fluxbox、x11vnc 和 FastAPI 服务。
+默认访问地址：
 
-重启：
+```text
+http://SERVER_IP:8000/
+```
+
+常用命令：
 
 ```bash
 sudo ./restart.sh
-```
-
-查看日志：
-
-```bash
 journalctl -u ctyun-manager -f
 ```
+
+如果不希望脚本执行系统包升级，可以这样运行：
+
+```bash
+sudo CTYUN_MANAGER_SKIP_SYSTEM_UPGRADE=1 ./install.sh
+```
+
+如果 8000 端口被占用，可以指定端口：
+
+```bash
+sudo CTYUN_MANAGER_PORT=8080 ./install.sh
+```
+
+## 部署方式二：Docker Compose 一键部署
+
+适合希望隔离运行环境的服务器。脚本会自动安装 Docker Engine 和 Docker Compose 插件，生成 `.env`，构建镜像并启动服务。
+
+```bash
+sudo ./install-docker.sh
+```
+
+默认访问地址：
+
+```text
+http://SERVER_IP:8000/
+```
+
+常用命令：
+
+```bash
+docker compose ps
+docker compose logs -f
+docker compose restart
+```
+
+如需换端口：
+
+```bash
+sudo CTYUN_MANAGER_PORT=8080 ./install-docker.sh
+```
+
+Docker Compose 模式的数据保存在项目目录的 `data/`，包括 SQLite 数据库和 `master.key`。迁移服务器时必须一起迁移 `data/`，否则已加密的账号密码无法解密。
+
+## 首次登录与安全
+
+两种部署方式首次账号均为：
+
+```text
+用户名：admin
+密码：change-me-now
+```
+
+安装后请编辑 `.env`，修改 `CTYUN_MANAGER_ADMIN_PASSWORD`，然后重启服务。
 
 ## Codex 续接
 

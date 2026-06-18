@@ -1,0 +1,23 @@
+services:
+  ctyun-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ctyun-manager:local
+    container_name: ctyun-manager
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CTYUN_MANAGER_DB: /app/data/ctyun-manager.db
+      CTYUN_MANAGER_PORT: 8000
+      CTYUN_MANAGER_PUBLIC_URL: ${CTYUN_MANAGER_PUBLIC_URL:-http://127.0.0.1:8000}
+      CTYUN_BROWSER_HEADFUL: ${CTYUN_BROWSER_HEADFUL:-1}
+      PLAYWRIGHT_BROWSERS_PATH: /app/.playwright
+      HOME: /app/data/home
+      DISPLAY: :99
+    ports:
+      - "${CTYUN_MANAGER_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    shm_size: "1gb"

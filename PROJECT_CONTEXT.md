@@ -44,8 +44,12 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - AC 管理已按用户要求移除。
   - 多数列表具备编辑入口，英文操作已改为中文。
 - 本地版本：
-  - 当前构建：`2026.06.18.2351`
+  - 当前构建：`2026.06.19.0144`
   - 本地验证地址：`http://127.0.0.1:8000/`
+- 部署方式：
+  - Linux 服务器直装：`sudo ./install.sh`
+  - Docker Compose 一键部署：`sudo ./install-docker.sh`
+  - 两种方式默认端口都是 `8000`，可通过 `CTYUN_MANAGER_PORT=8080` 改端口。
 
 ## 关键文件结构
 
@@ -71,6 +75,8 @@ API_REFERENCE.md                  内部接口记录
 PROJECT_CONTEXT.md                Codex 续接上下文
 README.md                         项目说明
 install.sh/start.sh/restart.sh    Linux 部署脚本
+install-docker.sh                 Docker Compose 一键部署脚本
+Dockerfile/docker-compose.yml      Docker Compose 部署文件
 requirements.txt                  Python 依赖
 ```
 
@@ -88,15 +94,13 @@ requirements.txt                  Python 依赖
 - 支付状态以官方 `/unifyapi/upayquery` 为准。
 - 快速下单路径曾出现官方重定向回充值页，因此必须验证收银台控件真实出现，不能只看 URL。
 - 包内和 GitHub 仓库禁止包含数据库、密钥、浏览器状态、日志。
+- 直装方式使用 systemd 运行 `start.sh`，脚本负责启动 Xvfb、fluxbox、x11vnc 和 FastAPI。
+- Docker Compose 方式使用本地 `data/` 挂载到容器 `/app/data`，迁移时必须保留 `data/master.key` 和 SQLite 数据库。
 
 ## 当前待办
 
-- 将本项目推送到用户 GitHub。
-  - 当前本机没有 `git` 和 `gh` 命令。
-  - 当前环境没有发现 `GITHUB_TOKEN`。
-  - 需要用户提供 GitHub 仓库地址或 Personal Access Token，或先安装并登录 Git/GitHub CLI。
 - 公网 `http://43.119.30.80:8000/` 需要部署最新包后才会更新。
-  - 最近一次本地版本：`2026.06.18.2351`
+  - 最近一次本地版本：`2026.06.19.0144`
   - 之前公网曾停留在旧版本，部署后应先检查 `/api/version`。
 - 继续实测支付成功后：
   - 平台弹窗是否显示成功页。
@@ -110,24 +114,24 @@ requirements.txt                  Python 依赖
 
 ```text
 请先阅读 README.md、PROJECT_CONTEXT.md、API_REFERENCE.md，然后继续这个天翼云/爱快管理平台项目。
-当前重点是验证充值成功后的余额刷新和 GitHub 仓库同步。
+当前重点是验证充值成功后的余额刷新、爱快真实网关映射，以及部署脚本实机安装效果。
 ```
 
-## GitHub 推送准备
+## GitHub 仓库
 
-推荐仓库名：
+仓库地址：
 
 ```text
-ctyun-manager
+https://github.com/dayou0168/ctyun-manager
 ```
 
-推荐首次提交说明：
+默认分支：
 
 ```text
-Initial ctyun manager platform with recharge and ikuai modules
+main
 ```
 
-推送前必须确认以下文件未被提交：
+提交前必须确认以下文件未被提交：
 
 ```text
 .env

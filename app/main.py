@@ -38,7 +38,7 @@ from .services.browser_automation import (
 from .services.ctyun_client import CtyunClientError, CtyunClientSkipped, build_client, build_region_client
 from .services.ikuai_client import IkuaiClient, IkuaiClientError, IKUAI_MENU_GROUPS, IKUAI_SECTION_ACTIONS, SECTION_CALLS, gateway_summary, normalize_base_url
 
-APP_VERSION = "2026.06.18.2351"
+APP_VERSION = "2026.06.19.0144"
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -689,7 +689,7 @@ def index() -> FileResponse:
 def version() -> dict[str, Any]:
     return {
         "version": APP_VERSION,
-        "build_time": "2026-06-18 23:51 Asia/Shanghai",
+        "build_time": "2026-06-19 01:44 Asia/Shanghai",
         "ctyun_mode": settings.ctyun_mode,
         "encryption_key_status": encryption_key_status(),
     }
