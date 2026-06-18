@@ -106,6 +106,7 @@ requirements.txt                  Python 依赖
 - 直装方式使用 systemd 运行 `start.sh`，脚本负责启动 Xvfb、fluxbox、x11vnc 和 FastAPI。
 - `docker-compose.deploy.yml` 直接拉取 `ghcr.io/dayou0168/ctyun-manager:latest`，不需要服务器有完整源码。
 - GHCR 镜像通过 `.github/workflows/docker-image.yml` 在推送 `main` 后自动构建发布。
+- 2026-06-19 首次触发 GHCR workflow 失败，GitHub 返回：账号 recent account payments failed 或 spending limit 需要调整。修复 GitHub Billing 后重新运行 workflow，直接 yaml 部署才有可拉取镜像。
 - 发布版 Docker Compose 使用命名卷 `ctyun-manager-data` 持久化 `/app/data`，迁移时必须备份该 volume 内的 `master.key` 和 SQLite 数据库。
 - 本地源码 Docker Compose 仍保留 `docker-compose.yml`，它使用 `build:` 从当前源码构建镜像，并把本地 `./data` 挂载到容器 `/app/data`。
 

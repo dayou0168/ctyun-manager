@@ -101,7 +101,7 @@ sudo ./install.sh
 
 ## 部署方式二：Docker Compose 直接部署
 
-适合希望隔离运行环境的服务器。发布版 Compose 文件 `docker-compose.deploy.yml` 可以直接拉取镜像部署，不需要服务器上有完整源码。
+适合希望隔离运行环境的服务器。发布版 Compose 文件 `docker-compose.deploy.yml` 可以直接拉取镜像部署，不需要服务器上有完整源码。这个方式依赖镜像 `ghcr.io/dayou0168/ctyun-manager:latest` 已经由 GitHub Actions 构建发布。
 
 如果服务器已经安装 Docker 和 Docker Compose，可直接下载 yaml 部署：
 
