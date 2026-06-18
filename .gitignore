@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+.playwright/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
+data/
+master.key
+*.log
+work-*.out.log
+work-*.err.log
+ctyun-manager.zip

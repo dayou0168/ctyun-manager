@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>天翼云多账号管理</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260618-2351">
+</head>
+<body>
+  <div id="loginView" class="login-shell">
+    <form id="loginForm" class="login-panel">
+      <div class="brand-mark">CT</div>
+      <h1>天翼云管理台</h1>
+      <p>个人多账号资源控制中心</p>
+      <label>平台账号<input name="username" autocomplete="username" required></label>
+      <label>平台密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="primary full" type="submit">登录</button>
+      <div id="loginError" class="form-error"></div>
+      <div id="loginVersion" class="build-version">版本检查中</div>
+    </form>
+  </div>
+
+  <div id="appView" class="app-shell hidden">
+    <aside>
+      <div class="side-brand"><span>CT</span><strong>天翼云管理台</strong></div>
+      <nav id="nav">
+        <details class="nav-group" open>
+          <summary>天翼云</summary>
+          <button class="active" data-view="dashboard">概览</button>
+          <button data-view="accounts">云账号</button>
+          <button data-view="ecs">云主机</button>
+          <button data-view="eip">弹性 IP</button>
+          <button data-view="vpc">VPC 网络</button>
+          <button data-view="image">镜像</button>
+          <button data-view="recycle">退订与释放</button>
+          <button data-view="operations">操作日志</button>
+        </details>
+        <details class="nav-group" open>
+          <summary>爱快</summary>
+          <button data-view="ikuai">网关后台</button>
+        </details>
+      </nav>
+      <div id="appVersion" class="app-version">版本检查中</div>
+      <button id="logoutBtn" class="logout">退出登录</button>
+    </aside>
+
+    <main>
+      <header>
+      <div><h2 id="pageTitle">概览</h2><p id="pageSubtitle">查看全部账号和资源状态</p></div>
+      <div class="header-actions">
+          <span id="modeBadge" class="mode-badge">模式</span>
+          <span id="refreshBadge" class="mode-badge refresh-badge">未刷新</span>
+          <select id="accountFilter"><option value="">全部账号</option></select>
+          <button id="consoleBtn">官方控制台</button>
+          <button id="syncBtn">同步资源</button>
+          <button id="addAccountBtn" class="primary">添加账号</button>
+        </div>
+      </header>
+      <section id="content"></section>
+      <div id="pageLoading" class="page-loading hidden"><span>正在加载...</span></div>
+    </main>
+  </div>
+
+  <dialog id="accountDialog">
+    <form id="accountForm" method="dialog">
+      <div class="dialog-head"><div><h3 id="accountDialogTitle">添加天翼云账号</h3><p id="accountDialogHint">一次性录入 API 与网页登录所需资料</p></div><button type="button" class="icon-btn" data-close>×</button></div>
+      <input name="id" type="hidden">
+      <div class="form-grid">
+        <label>账号名称<input name="name" placeholder="例如：生产账号 A" required></label>
+        <label>天翼云账号ID<input name="provider_account_id" placeholder="登录成功后自动获取" readonly></label>
+        <label class="wide">资源池ID列表 / regionID（选填）<textarea name="region" rows="3" placeholder="不填则自动查询并同步全部资源池；也可每行一个或用逗号分隔来限制范围"></textarea></label>
+        <label>天翼云登录账号<input name="username" autocomplete="off" required></label>
+        <label>天翼云登录密码<input name="password" type="password" autocomplete="new-password" required></label>
+        <label class="wide">Google 2FA 密钥或 otpauth URI<input name="totp_secret" autocomplete="off" placeholder="BASE32 密钥或 otpauth://..." required></label>
+        <label>AccessKey<input name="ak" autocomplete="off" required></label>
+        <label>SecretKey<input name="sk" type="password" autocomplete="new-password" required></label>
+        <label class="wide">备注<textarea name="notes" rows="2"></textarea></label>
+      </div>
+      <div id="accountError" class="form-error"></div>
+      <div class="dialog-actions"><button type="button" data-close>取消</button><button id="saveAccountBtn" class="primary" type="submit">加密保存账号</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="actionDialog">
+    <div class="dialog-head"><div><h3 id="actionTitle">确认操作</h3><p id="actionText"></p></div><button class="icon-btn" data-close>×</button></div>
+    <div class="dialog-actions"><button data-close>取消</button><button id="confirmActionBtn" class="danger">确认执行</button></div>
+  </dialog>
+
+  <dialog id="regionsDialog">
+    <div>
+      <div class="dialog-head"><div><h3>资源池列表</h3><p>复制需要管理的 regionID，填到账号编辑里的资源池ID列表</p></div><button class="icon-btn" data-close>×</button></div>
+      <div id="regionsContent" class="region-list"></div>
+    </div>
+  </dialog>
+
+  <dialog id="fieldsDialog">
+    <form id="fieldsForm" method="dialog">
+      <div class="dialog-head"><div><h3 id="fieldsTitle">资源操作</h3><p id="fieldsHint"></p></div><button type="button" class="icon-btn" data-close>×</button></div>
+      <div id="fieldsContent" class="form-grid"></div>
+      <div id="fieldsError" class="form-error"></div>
+      <div class="dialog-actions"><button type="button" data-close>取消</button><button id="fieldsSubmitBtn" class="primary" type="submit">提交</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="ikuaiDialog">
+    <form id="ikuaiForm" method="dialog">
+      <div class="dialog-head"><div><h3 id="ikuaiDialogTitle">添加爱快网关</h3><p>保存 Web 管理地址和登录资料，后续由平台统一登录查询</p></div><button type="button" class="icon-btn" data-close>×</button></div>
+      <input name="id" type="hidden">
+      <div class="form-grid">
+        <label>网关名称<input name="name" placeholder="例如：广州机房爱快" required></label>
+        <label>Web 地址<input name="base_url" placeholder="http://192.168.1.1 或 https://example.com:8443" required></label>
+        <label>登录账号<input name="username" autocomplete="off"></label>
+        <label>登录密码<input name="password" type="password" autocomplete="new-password"></label>
+        <label class="wide">备注<textarea name="notes" rows="2"></textarea></label>
+      </div>
+      <div id="ikuaiError" class="form-error"></div>
+      <div class="dialog-actions"><button type="button" data-close>取消</button><button id="saveIkuaiBtn" class="primary" type="submit">加密保存网关</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="rechargeDialog" class="browser-dialog">
+    <div>
+      <div class="dialog-head">
+        <div><h3 id="rechargeTitle">官方充值</h3><p id="rechargeHint">这里显示该账号的天翼云官方页面</p></div>
+        <div class="payment-window-actions">
+          <a id="openPaymentWindow" class="button-link hidden" target="_blank" rel="noopener">新窗口打开</a>
+          <button id="cancelRechargeBtn" class="danger hidden" type="button">取消充值</button>
+          <button id="paymentFullscreenBtn" type="button">全屏</button>
+          <button id="browserDialogCloseBtn" type="button" class="icon-btn browser-close" data-close aria-label="关闭">×</button>
+        </div>
+      </div>
+      <div id="paymentMethods" class="payment-methods hidden">
+        <button type="button" data-payment-method="wechat">微信支付</button>
+        <button type="button" data-payment-method="alipay">支付宝</button>
+        <button type="button" data-payment-method="bestpay">翼支付</button>
+      </div>
+      <iframe id="rechargeFrame" title="天翼云官方充值页面"></iframe>
+    </div>
+  </dialog>
+
+  <div id="toast"></div>
+  <script src="/static/app.js?v=20260618-2351"></script>
+</body>
+</html>

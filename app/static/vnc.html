@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>天翼云浏览器会话</title>
+  <style>
+    html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#111}
+    #screen{position:absolute;inset:36px 0 0;overflow:auto;background:#111}
+    #screen.fit{display:flex;align-items:center;justify-content:center;overflow:hidden}
+    #status{position:fixed;top:0;left:0;right:0;z-index:10;height:36px;padding:0 10px;background:#26313a;color:#fff;font:13px/1.4 system-ui,sans-serif;display:flex;align-items:center;justify-content:space-between}
+    #status.error{background:#9b2c2c}
+    #status.connected{background:#237a57}
+    #viewerControls{display:flex;gap:6px}
+    #viewerControls button{border:1px solid #ffffff55;border-radius:4px;background:#ffffff16;color:#fff;padding:3px 8px;cursor:pointer}
+    #viewerControls button.active{background:#fff;color:#18212b}
+  </style>
+  <script>
+    if (globalThis.crypto && !globalThis.crypto.randomUUID) {
+      globalThis.crypto.randomUUID = function () {
+        const bytes = new Uint8Array(16);
+        globalThis.crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 15) | 64;
+        bytes[8] = (bytes[8] & 63) | 128;
+        const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+        return `${hex.slice(0,4).join("")}-${hex.slice(4,6).join("")}-${hex.slice(6,8).join("")}-${hex.slice(8,10).join("")}-${hex.slice(10).join("")}`;
+      };
+    }
+  </script>
+</head>
+<body>
+  <div id="status"><span id="statusText">正在连接浏览器会话...</span><span id="viewerControls"><button id="focusBtn" class="active" type="button">支付聚焦</button><button id="fitBtn" type="button">完整页面</button></span></div>
+  <div id="screen"></div>
+  <script type="module" src="/static/vnc.js?v=20260618-2351"></script>
+</body>
+</html>
