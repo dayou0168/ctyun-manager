@@ -1,6 +1,6 @@
 # Codex 项目上下文
 
-更新时间：2026-06-18 23:51 Asia/Shanghai
+更新时间：2026-06-19 Asia/Shanghai
 
 ## 项目目标
 
@@ -11,6 +11,17 @@
 ```text
 C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
 ```
+
+## 协作规则
+
+- 以后 Codex 对代码、配置、脚本或项目文档做有效更新后，需要同步提交并推送到 GitHub。
+- 默认远程仓库：`https://github.com/dayou0168/ctyun-manager`
+- 默认分支：`main`
+- 每次更新流程：
+  - 先检查 `git status`，确认没有误提交数据库、密钥、日志、缓存等运行态文件。
+  - 完成必要验证后执行 `git add`、`git commit`。
+  - 推送到 `origin/main`。
+- 除非用户明确要求，不要提交 `.env`、`master.key`、`ctyun-manager.db*`、`data/`、`.playwright/`、`.venv/`、日志文件。
 
 ## 已完成事项
 

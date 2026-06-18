@@ -76,3 +76,5 @@ journalctl -u ctyun-manager -f
 - `API_REFERENCE.md`
 
 然后再继续开发。`PROJECT_CONTEXT.md` 记录了目标、文件结构、关键决策、已完成事项和待办。
+
+后续每次由 Codex 更新代码、配置、脚本或项目文档后，默认需要提交并推送到 GitHub 仓库 `dayou0168/ctyun-manager` 的 `main` 分支。
