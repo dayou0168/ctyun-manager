@@ -1268,7 +1268,7 @@ async function renderRustdesk(seq = state.renderSeq) {
         <form id="rustdeskForm" class="rustdesk-form">
           <div class="form-grid">
             <label>GitHub 公开仓库<input name="repo" placeholder="owner/repo 或 https://github.com/owner/repo" required></label>
-            <label>Personal access token classic<input name="token" type="password" autocomplete="off" placeholder="仅需 public_repo + workflow" required></label>
+            <label>Personal access token classic<input name="token" type="password" autocomplete="off" placeholder="至少需要 workflow，可用完删除" required></label>
             <label>RustDesk 官方版本<input name="rustdesk_version" placeholder="例如 1.4.7" required></label>
             <label>目标分支<input name="target_branch" placeholder="留空使用仓库默认分支"></label>
             <label>ID 服务器<input name="id_server" placeholder="例如 hbbs.example.com" required></label>
@@ -1294,7 +1294,7 @@ async function renderRustdesk(seq = state.renderSeq) {
           </details>
           <div class="inline-notice">
             <div>当前方案按 RustDesk 1.4.7 成功路径实现：服务器信息写源码常量，删除 <code>res/local_custom_client.json</code>，并把子模块本地化。</div>
-            <div>目标仓库必须是公开仓库；classic token 请只勾选 <code>public_repo</code> 和 <code>workflow</code>。</div>
+            <div>目标仓库必须是公开仓库；如果 GitHub 选择 <code>workflow</code> 时自动勾选 <code>repo</code>，可以继续使用，用完后建议立即删除 token。</div>
           </div>
           <div id="rustdeskError" class="form-error"></div>
           <div class="dialog-actions rustdesk-actions"><button id="rustdeskSubmitBtn" class="primary" type="submit">开始写入目标仓库</button></div>

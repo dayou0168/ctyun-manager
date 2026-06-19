@@ -182,7 +182,7 @@ curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/instal
 
 - 目标仓库必须是 GitHub 公开仓库。
 - 使用 Personal access token classic。
-- token 只需要 `public_repo` 和 `workflow`，不要勾选 `repo`。
+- token 至少需要 `workflow`，公开仓库写入需要 `public_repo`；如果 GitHub 选择 `workflow` 时自动勾选 `repo`，可以继续使用，但建议任务完成后立即删除 token。
 - token 只在本次后台任务中使用，不保存数据库，不写入日志。
 - RustDesk 版本填写官方 tag，例如 `1.4.7`。
 

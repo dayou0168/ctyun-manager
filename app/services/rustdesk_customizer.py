@@ -96,11 +96,13 @@ def validate_github_repo(repo_value: str, token: str) -> GitHubRepo:
         for scope in (headers.get("x-oauth-scopes") or "").split(",")
         if scope.strip()
     }
-    if "repo" in scopes:
-        raise RustDeskCustomizeError("token 权限过大：请使用只包含 public_repo + workflow 的 classic token，不要勾选 repo")
-    missing = [scope for scope in ("public_repo", "workflow") if scope not in scopes]
-    if missing:
-        raise RustDeskCustomizeError(f"token 缺少权限：{', '.join(missing)}")
+    if scopes:
+        if "repo" not in scopes:
+            missing = [scope for scope in ("public_repo", "workflow") if scope not in scopes]
+            if missing:
+                raise RustDeskCustomizeError(f"token 缺少权限：{', '.join(missing)}")
+        elif "workflow" not in scopes:
+            raise RustDeskCustomizeError("token 缺少权限：workflow")
     if data.get("private"):
         raise RustDeskCustomizeError("目标仓库必须是公开仓库，当前仓库是 Private")
     clone_url = str(data.get("clone_url") or f"https://github.com/{owner}/{name}.git")

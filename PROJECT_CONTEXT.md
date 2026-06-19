@@ -47,7 +47,7 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - 左侧 `应用工具 / RustDesk 定制`。
   - 后端接口：`/api/tools/rustdesk/jobs`。
   - 使用 classic PAT 临时访问用户公开 GitHub 仓库，token 不保存数据库，不写日志。
-  - token 权限要求 `public_repo + workflow`，显式拒绝包含 `repo` 权限的 token。
+  - token 至少需要 `workflow`；建议 `public_repo + workflow`。如果 GitHub UI 选择 `workflow` 时自动勾选 `repo`，平台允许继续，但仍强制目标仓库必须公开。
   - 校验官方 RustDesk tag，例如 `1.4.7`。
   - 拉取官方源码、递归子模块、本地化子模块、应用源码补丁、推送到目标仓库。
   - 采用 1.4.7 成功方案：服务器信息写源码常量，不使用 `res/local_custom_client.json`。
@@ -118,7 +118,7 @@ requirements.txt                  Python 依赖
 - 2026-06-19 首次触发 GHCR workflow 失败，GitHub 返回：账号 recent account payments failed 或 spending limit 需要调整。修复 GitHub Billing 后重新运行 workflow，直接 yaml 部署才有可拉取镜像。
 - 发布版 Docker Compose 使用命名卷 `ctyun-manager-data` 持久化 `/app/data`，迁移时必须备份该 volume 内的 `master.key` 和 SQLite 数据库。
 - 本地源码 Docker Compose 仍保留 `docker-compose.yml`，它使用 `build:` 从当前源码构建镜像，并把本地 `./data` 挂载到容器 `/app/data`。
-- RustDesk 定制不使用数据库保存 token。任务状态只保存在进程内存，服务重启后历史任务会丢失。
+- RustDesk 定制不使用数据库保存 token。任务状态只保存在进程内存，服务重启后历史任务会丢失。若用户只能创建带 `repo` 权限的 classic token，建议任务完成后立即删除该 token。
 - RustDesk 1.4.7 方案：
   - `libs/hbb_common/src/config.rs` 写 `RENDEZVOUS_SERVERS` 和 `RS_PUB_KEY`。
   - `src/common.rs` 在 `load_custom_client()` 中写入 `config::HARD_SETTINGS`。

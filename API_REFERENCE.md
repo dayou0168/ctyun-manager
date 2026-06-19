@@ -80,7 +80,7 @@ VIP 绑定：
 关键规则：
 
 - 目标仓库必须是 GitHub 公开仓库。
-- Personal access token classic 只允许 `public_repo + workflow`，拒绝包含 `repo` 权限的 token。
+- Personal access token classic 至少需要 `workflow`；公开仓库写入建议 `public_repo + workflow`。如果 GitHub UI 选择 `workflow` 时自动勾选 `repo`，平台允许继续，但仍要求目标仓库必须是公开仓库。
 - token 只在后台线程内临时使用，不写数据库，不写日志。
 - RustDesk 版本校验官方 tag：
 
