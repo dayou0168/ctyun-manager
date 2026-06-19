@@ -40,7 +40,7 @@ from .services.ctyun_client import CtyunClientError, CtyunClientSkipped, build_c
 from .services.ikuai_client import IkuaiClient, IkuaiClientError, IKUAI_MENU_GROUPS, IKUAI_SECTION_ACTIONS, SECTION_CALLS, gateway_summary, normalize_base_url
 from .services.rustdesk_customizer import RustDeskCustomizeError, customize_rustdesk
 
-APP_VERSION = "2026.06.19.2319"
+APP_VERSION = "2026.06.20.0105"
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -720,7 +720,7 @@ def index() -> FileResponse:
 def version() -> dict[str, Any]:
     return {
         "version": APP_VERSION,
-        "build_time": "2026-06-19 23:19 Asia/Shanghai",
+        "build_time": "2026-06-20 01:05 Asia/Shanghai",
         "ctyun_mode": settings.ctyun_mode,
         "encryption_key_status": encryption_key_status(),
     }

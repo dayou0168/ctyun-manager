@@ -465,7 +465,9 @@ def commit_and_push_target(
     redactions = token_redactions(token)
     branch = payload.get("target_branch") or repo.default_branch or "main"
     run_command(["git", "checkout", "-B", branch], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=60)
-    run_command(["git", "add", "-A"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=300)
+    # RustDesk tracks several source assets that also match its own .gitignore
+    # patterns, such as PNG/SVG icons required by Android, macOS, and portable builds.
+    run_command(["git", "add", "-A", "--force"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=300)
     status = run_command(["git", "status", "--porcelain"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=60)
     if not status.strip():
         progress("目标仓库没有产生新的文件差异")
