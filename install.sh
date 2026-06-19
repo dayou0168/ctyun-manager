@@ -39,7 +39,7 @@ echo "Installing system dependencies..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   python3 python3-venv python3-pip \
   xvfb x11vnc fluxbox novnc \
-  ca-certificates curl fonts-noto-cjk iproute2 procps
+  ca-certificates curl fonts-noto-cjk git iproute2 procps
 
 if ss -H -ltn "sport = :$APP_PORT" | grep -q .; then
   echo "Port $APP_PORT is already in use by another service. This installer will not stop or migrate it."

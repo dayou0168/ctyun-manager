@@ -17,6 +17,7 @@ RUN apt-get update \
       curl \
       fluxbox \
       fonts-noto-cjk \
+      git \
       iproute2 \
       novnc \
       procps \

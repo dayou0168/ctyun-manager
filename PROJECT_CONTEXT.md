@@ -43,8 +43,16 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - 爱快主菜单按 3.7+ UI 参考补齐大量功能映射。
   - AC 管理已按用户要求移除。
   - 多数列表具备编辑入口，英文操作已改为中文。
+- RustDesk 定制工具：
+  - 左侧 `应用工具 / RustDesk 定制`。
+  - 后端接口：`/api/tools/rustdesk/jobs`。
+  - 使用 classic PAT 临时访问用户公开 GitHub 仓库，token 不保存数据库，不写日志。
+  - token 权限要求 `public_repo + workflow`，显式拒绝包含 `repo` 权限的 token。
+  - 校验官方 RustDesk tag，例如 `1.4.7`。
+  - 拉取官方源码、递归子模块、本地化子模块、应用源码补丁、推送到目标仓库。
+  - 采用 1.4.7 成功方案：服务器信息写源码常量，不使用 `res/local_custom_client.json`。
 - 本地版本：
-  - 当前构建：`2026.06.19.0206`
+  - 当前构建：`2026.06.19.2153`
   - 本地验证地址：`http://127.0.0.1:8000/`
 - 部署方式：
   - Linux 服务器直装远程入口：`install-linux.sh`
@@ -66,6 +74,7 @@ app/
     ctyun_client.py               天翼云 OpenAPI 客户端
     browser_automation.py         天翼云网页登录、充值、VNC、余额读取
     ikuai_client.py               爱快 Web API 封装和菜单映射
+    rustdesk_customizer.py        RustDesk 定制源码生成和 GitHub 写入
   static/
     index.html                    主页面
     app.js                        主前端逻辑
@@ -109,11 +118,17 @@ requirements.txt                  Python 依赖
 - 2026-06-19 首次触发 GHCR workflow 失败，GitHub 返回：账号 recent account payments failed 或 spending limit 需要调整。修复 GitHub Billing 后重新运行 workflow，直接 yaml 部署才有可拉取镜像。
 - 发布版 Docker Compose 使用命名卷 `ctyun-manager-data` 持久化 `/app/data`，迁移时必须备份该 volume 内的 `master.key` 和 SQLite 数据库。
 - 本地源码 Docker Compose 仍保留 `docker-compose.yml`，它使用 `build:` 从当前源码构建镜像，并把本地 `./data` 挂载到容器 `/app/data`。
+- RustDesk 定制不使用数据库保存 token。任务状态只保存在进程内存，服务重启后历史任务会丢失。
+- RustDesk 1.4.7 方案：
+  - `libs/hbb_common/src/config.rs` 写 `RENDEZVOUS_SERVERS` 和 `RS_PUB_KEY`。
+  - `src/common.rs` 在 `load_custom_client()` 中写入 `config::HARD_SETTINGS`。
+  - 删除 `res/local_custom_client.json` 和 `.github/scripts/apply-bundled-server-settings.py`。
+  - workflows 删除 server secrets 相关行，并把 checkout submodules 设为 false。
 
 ## 当前待办
 
 - 公网 `http://43.119.30.80:8000/` 需要部署最新包后才会更新。
-  - 最近一次本地版本：`2026.06.19.0206`
+  - 最近一次本地版本：`2026.06.19.2153`
   - 之前公网曾停留在旧版本，部署后应先检查 `/api/version`。
 - 继续实测支付成功后：
   - 平台弹窗是否显示成功页。

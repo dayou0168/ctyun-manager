@@ -66,3 +66,32 @@ VIP 绑定：
 | 官方收银台入口 | `GET /gw/account/cash/Recharge` | `amount` 为分，`frontUrl=/virtual/redirect/funddetail`，`platform=1`，返回 `nextUrl` |
 
 用户在平台确认充值金额后，程序会优先复用官方登录态直调 `Recharge` 创建收银台流程，以减少页面点击等待；如果官方接口返回结构变化或拒绝请求，会自动回退到内嵌官方充值页面点击流程。
+
+## RustDesk 定制工具接口
+
+平台内部接口：
+
+| 功能 | 方法与路径 |
+| --- | --- |
+| 创建定制任务 | `POST /api/tools/rustdesk/jobs` |
+| 查询最近任务 | `GET /api/tools/rustdesk/jobs` |
+| 查询任务详情 | `GET /api/tools/rustdesk/jobs/{job_id}` |
+
+关键规则：
+
+- 目标仓库必须是 GitHub 公开仓库。
+- Personal access token classic 只允许 `public_repo + workflow`，拒绝包含 `repo` 权限的 token。
+- token 只在后台线程内临时使用，不写数据库，不写日志。
+- RustDesk 版本校验官方 tag：
+
+```bash
+git ls-remote --tags https://github.com/rustdesk/rustdesk.git refs/tags/1.4.7
+```
+
+源码写入策略：
+
+- `libs/hbb_common/src/config.rs` 写入 `RENDEZVOUS_SERVERS` 和 `RS_PUB_KEY`。
+- `src/common.rs` 写入 `config::HARD_SETTINGS`，包括 API fallback、默认密码、verification-method、allow-remote-config-modification、allow-hide-cm。
+- 删除 `res/local_custom_client.json`。
+- 删除 `.github/scripts/apply-bundled-server-settings.py`。
+- workflow 中移除 `RENDEZVOUS_SERVER`、`RELAY_SERVER`、`API_SERVER`、`RS_PUB_KEY` secrets 及 bundled server settings 步骤。

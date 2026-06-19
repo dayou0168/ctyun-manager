@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from decimal import Decimal, InvalidOperation
@@ -37,8 +38,9 @@ from .services.browser_automation import (
 )
 from .services.ctyun_client import CtyunClientError, CtyunClientSkipped, build_client, build_region_client
 from .services.ikuai_client import IkuaiClient, IkuaiClientError, IKUAI_MENU_GROUPS, IKUAI_SECTION_ACTIONS, SECTION_CALLS, gateway_summary, normalize_base_url
+from .services.rustdesk_customizer import RustDeskCustomizeError, customize_rustdesk
 
-APP_VERSION = "2026.06.19.0206"
+APP_VERSION = "2026.06.19.2153"
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
     "Pragma": "no-cache",
@@ -127,6 +129,33 @@ class IkuaiSectionActionBody(BaseModel):
     payload: dict[str, Any] = {}
 
 
+class RustDeskAboutBody(BaseModel):
+    title: str = ""
+    product_name: str = ""
+    vendor_name: str = ""
+    support_url: str = ""
+    privacy_url: str = ""
+    show_official_link: bool = True
+    show_license_text: bool = True
+
+
+class RustDeskCustomizeBody(BaseModel):
+    repo: str
+    token: str
+    rustdesk_version: str
+    id_server: str
+    rs_pub_key: str
+    relay_server: str = ""
+    api_server: str = ""
+    default_password: str = ""
+    allow_remote_config_modification: bool = True
+    hide_cm: bool = True
+    hide_builtin_server_values: bool = True
+    about: RustDeskAboutBody = RustDeskAboutBody()
+    commit_message: str = ""
+    target_branch: str = ""
+
+
 SYNC_TYPES = (
     "ecs",
     "eip",
@@ -146,6 +175,8 @@ resource_sync_locks: dict[tuple[int, str], threading.Lock] = {}
 resource_sync_locks_guard = threading.Lock()
 account_id_verified: set[int] = set()
 recharge_prewarm_lock = asyncio.Lock()
+rustdesk_jobs_lock = threading.Lock()
+rustdesk_jobs: dict[str, dict[str, Any]] = {}
 option_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
 option_cache_lock = threading.Lock()
 option_prewarm_keys: set[tuple[int, str]] = set()
@@ -689,7 +720,7 @@ def index() -> FileResponse:
 def version() -> dict[str, Any]:
     return {
         "version": APP_VERSION,
-        "build_time": "2026-06-19 02:06 Asia/Shanghai",
+        "build_time": "2026-06-19 21:53 Asia/Shanghai",
         "ctyun_mode": settings.ctyun_mode,
         "encryption_key_status": encryption_key_status(),
     }
@@ -736,6 +767,121 @@ def list_accounts(user: dict = Depends(require_user)) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute("select * from ctyun_accounts order by id desc").fetchall()
     return [public_account(dict(row)) for row in rows]
+
+
+def _safe_rustdesk_payload(body: RustDeskCustomizeBody) -> dict[str, Any]:
+    payload = body.dict()
+    payload.pop("token", None)
+    return payload
+
+
+def _public_rustdesk_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "message": job.get("message", ""),
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "payload": job.get("payload", {}),
+        "logs": list(job.get("logs", []))[-240:],
+        "result": job.get("result"),
+        "error": job.get("error", ""),
+    }
+
+
+def _append_rustdesk_log(job_id: str, message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    with rustdesk_jobs_lock:
+        job = rustdesk_jobs.get(job_id)
+        if not job:
+            return
+        job["logs"].append({"time": time.strftime("%H:%M:%S"), "message": text})
+        job["logs"] = job["logs"][-300:]
+        job["message"] = text.splitlines()[-1][:300]
+        job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _run_rustdesk_job(job_id: str, payload: dict[str, Any]) -> None:
+    with rustdesk_jobs_lock:
+        if job_id in rustdesk_jobs:
+            rustdesk_jobs[job_id]["status"] = "running"
+            rustdesk_jobs[job_id]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        result = customize_rustdesk(payload, lambda message: _append_rustdesk_log(job_id, message))
+        with rustdesk_jobs_lock:
+            job = rustdesk_jobs[job_id]
+            job["status"] = "success"
+            job["result"] = result
+            job["message"] = "RustDesk 定制仓库写入完成"
+            job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        record_operation(None, "rustdesk", result.get("repo", ""), "customize", "success", result.get("actions_url", ""))
+    except RustDeskCustomizeError as exc:
+        with rustdesk_jobs_lock:
+            job = rustdesk_jobs.get(job_id)
+            if job:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+                job["message"] = str(exc)
+                job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _append_rustdesk_log(job_id, str(exc))
+        record_operation(None, "rustdesk", payload.get("repo", ""), "customize", "failed", str(exc))
+    except Exception as exc:
+        message = f"RustDesk 定制任务异常：{exc}"
+        with rustdesk_jobs_lock:
+            job = rustdesk_jobs.get(job_id)
+            if job:
+                job["status"] = "failed"
+                job["error"] = message
+                job["message"] = message
+                job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _append_rustdesk_log(job_id, message)
+        record_operation(None, "rustdesk", payload.get("repo", ""), "customize", "failed", message)
+
+
+@app.get("/api/tools/rustdesk/jobs")
+def list_rustdesk_jobs(user: dict = Depends(require_user)) -> list[dict[str, Any]]:
+    with rustdesk_jobs_lock:
+        jobs = sorted(rustdesk_jobs.values(), key=lambda item: item["created_at"], reverse=True)
+        return [_public_rustdesk_job(job) for job in jobs[:20]]
+
+
+@app.get("/api/tools/rustdesk/jobs/{job_id}")
+def get_rustdesk_job(job_id: str, user: dict = Depends(require_user)) -> dict[str, Any]:
+    with rustdesk_jobs_lock:
+        job = rustdesk_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="rustdesk_job_not_found")
+        return _public_rustdesk_job(job)
+
+
+@app.post("/api/tools/rustdesk/jobs")
+def create_rustdesk_job(body: RustDeskCustomizeBody, user: dict = Depends(require_user)) -> dict[str, Any]:
+    payload = body.dict()
+    if not body.hide_builtin_server_values:
+        raise HTTPException(status_code=422, detail="当前定制方案固定隐藏内置服务器配置值，请保持开启")
+    job_id = uuid.uuid4().hex
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "message": "任务已创建，等待后台执行",
+        "created_at": now,
+        "updated_at": now,
+        "payload": _safe_rustdesk_payload(body),
+        "logs": [{"time": time.strftime("%H:%M:%S"), "message": "任务已创建，token 仅用于本次后台任务，不会保存"}],
+        "result": None,
+        "error": "",
+    }
+    with rustdesk_jobs_lock:
+        rustdesk_jobs[job_id] = job
+        if len(rustdesk_jobs) > 30:
+            for old_id in sorted(rustdesk_jobs, key=lambda key: rustdesk_jobs[key]["created_at"])[:-30]:
+                rustdesk_jobs.pop(old_id, None)
+    worker = threading.Thread(target=_run_rustdesk_job, args=(job_id, payload), name=f"rustdesk-customize-{job_id[:8]}", daemon=True)
+    worker.start()
+    return _public_rustdesk_job(job)
 
 
 @app.get("/api/ikuai/gateways")

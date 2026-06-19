@@ -23,6 +23,8 @@ const state = {
   rechargeToken: 0,
   rechargePrewarmQueued: false,
   rechargeProgressTimer: 0,
+  rustdeskJobId: localStorage.getItem("ctyun:rustdeskJobId") || "",
+  rustdeskPollTimer: 0,
   pendingFieldDefinitions: [],
   pendingFieldOptions: new Map(),
   pendingFieldGroupedOptions: new Map(),
@@ -617,6 +619,7 @@ const viewInfo = {
   vpc: ["VPC 网络", "管理 VPC、子网、安全组和路由"],
   image: ["镜像", "管理公共镜像、私有镜像和制作任务"],
   ikuai: ["爱快网关", "集中管理多个爱快 Web 后台"],
+  rustdesk: ["RustDesk 定制", "生成定制客户端源码并写入公开 GitHub 仓库"],
   recycle: ["退订与释放", "处理包周期退订与按需资源释放"],
   operations: ["操作日志", "查看资源操作和自动化执行记录"],
 };
@@ -1125,6 +1128,191 @@ async function renderOperations(seq = state.renderSeq) {
   const rows = await cachedApi("/api/operations", 8000);
   if (!isActiveRender(seq)) return;
   content.innerHTML = panel("最近 200 条操作", rows.length ? `<table><thead><tr><th>时间</th><th>账号</th><th>资源</th><th>动作</th><th>状态</th><th>消息</th></tr></thead><tbody>${rows.map((o) => `<tr><td>${escapeHtml(o.created_at)}</td><td>${escapeHtml(accountName(o.account_id))}</td><td>${escapeHtml(resourceTypeLabel(o.resource_type))} ${escapeHtml(o.resource_id || "")}</td><td>${escapeHtml(actionDisplayLabel(o.resource_type, o.action))}</td><td>${status(o.status)}</td><td>${escapeHtml(o.message || "-")}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">暂无操作记录</div>`);
+}
+
+function rustdeskStatusLabel(job = {}) {
+  const labels = { queued: "排队中", running: "执行中", success: "已完成", failed: "失败" };
+  return status(job.status || "unknown", labels[job.status] || "未知");
+}
+
+function rustdeskLogHtml(job = {}) {
+  const logs = job.logs || [];
+  if (!logs.length) return `<div class="rustdesk-log-empty">任务日志会显示在这里</div>`;
+  return logs.map((item) => `<div><time>${escapeHtml(item.time || "")}</time><span>${escapeHtml(item.message || "")}</span></div>`).join("");
+}
+
+function renderRustdeskJob(job = null) {
+  if (!job) {
+    return `<div class="rustdesk-job-card muted">还没有提交任务。填写左侧表单后，后台会开始拉取 RustDesk 官方源码并写入目标仓库。</div>`;
+  }
+  const result = job.result || {};
+  return `
+    <div class="rustdesk-job-card">
+      <div class="rustdesk-job-head">
+        <div>
+          <strong>${escapeHtml(job.payload?.repo || result.repo || "RustDesk 定制任务")}</strong>
+          <p>${escapeHtml(job.message || job.error || "等待执行")}</p>
+        </div>
+        ${rustdeskStatusLabel(job)}
+      </div>
+      <dl class="rustdesk-job-meta">
+        <dt>RustDesk 版本</dt><dd>${escapeHtml(job.payload?.rustdesk_version || result.rustdesk_version || "-")}</dd>
+        <dt>ID 服务器</dt><dd>${escapeHtml(job.payload?.id_server || "-")}</dd>
+        <dt>创建时间</dt><dd>${escapeHtml(job.created_at || "-")}</dd>
+        <dt>更新时间</dt><dd>${escapeHtml(job.updated_at || "-")}</dd>
+      </dl>
+      ${result.url ? `<div class="rustdesk-result-actions"><a class="button-link" href="${escapeHtml(result.url)}" target="_blank" rel="noopener">打开目标仓库</a><a class="button-link" href="${escapeHtml(result.actions_url || `${result.url}/actions`)}" target="_blank" rel="noopener">打开 Actions</a></div>` : ""}
+      ${job.error ? `<div class="form-error">${escapeHtml(job.error)}</div>` : ""}
+      <div class="rustdesk-log">${rustdeskLogHtml(job)}</div>
+    </div>`;
+}
+
+async function loadRustdeskJob(jobId = state.rustdeskJobId) {
+  if (!jobId) return null;
+  return api(`/api/tools/rustdesk/jobs/${encodeURIComponent(jobId)}?t=${Date.now()}`);
+}
+
+function startRustdeskPolling(jobId) {
+  state.rustdeskJobId = jobId || "";
+  if (state.rustdeskJobId) localStorage.setItem("ctyun:rustdeskJobId", state.rustdeskJobId);
+  clearInterval(state.rustdeskPollTimer);
+  if (!state.rustdeskJobId) return;
+  state.rustdeskPollTimer = window.setInterval(async () => {
+    if (state.view !== "rustdesk") return;
+    try {
+      const job = await loadRustdeskJob();
+      const target = $("#rustdeskJobPanel");
+      if (target) target.innerHTML = renderRustdeskJob(job);
+      if (["success", "failed"].includes(job.status)) {
+        clearInterval(state.rustdeskPollTimer);
+        state.rustdeskPollTimer = 0;
+      }
+    } catch (error) {
+      clearInterval(state.rustdeskPollTimer);
+      state.rustdeskPollTimer = 0;
+    }
+  }, 3000);
+}
+
+function rustdeskPayloadFromForm(form) {
+  const data = Object.fromEntries(new FormData(form));
+  return {
+    repo: data.repo || "",
+    token: data.token || "",
+    rustdesk_version: data.rustdesk_version || "",
+    id_server: data.id_server || "",
+    rs_pub_key: data.rs_pub_key || "",
+    relay_server: data.relay_server || "",
+    api_server: data.api_server || "",
+    default_password: data.default_password || "",
+    allow_remote_config_modification: Boolean(form.elements.allow_remote_config_modification.checked),
+    hide_cm: Boolean(form.elements.hide_cm.checked),
+    hide_builtin_server_values: true,
+    commit_message: data.commit_message || "",
+    target_branch: data.target_branch || "",
+    about: {
+      title: data.about_title || "",
+      product_name: data.about_product_name || "",
+      vendor_name: data.about_vendor_name || "",
+      support_url: data.about_support_url || "",
+      privacy_url: data.about_privacy_url || "",
+      show_official_link: Boolean(form.elements.about_show_official_link.checked),
+      show_license_text: Boolean(form.elements.about_show_license_text.checked),
+    },
+  };
+}
+
+async function submitRustdeskCustomize(event) {
+  event.preventDefault();
+  const form = event.target;
+  const error = $("#rustdeskError");
+  const button = $("#rustdeskSubmitBtn");
+  const jobPanel = $("#rustdeskJobPanel");
+  error.textContent = "";
+  button.disabled = true;
+  const oldText = button.textContent;
+  button.textContent = "正在创建任务...";
+  try {
+    const job = await api("/api/tools/rustdesk/jobs", {
+      method: "POST",
+      body: JSON.stringify(rustdeskPayloadFromForm(form)),
+    });
+    form.elements.token.value = "";
+    jobPanel.innerHTML = renderRustdeskJob(job);
+    startRustdeskPolling(job.id);
+    toast("RustDesk 定制任务已开始");
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
+  }
+}
+
+async function renderRustdesk(seq = state.renderSeq) {
+  let job = null;
+  if (state.rustdeskJobId) {
+    try {
+      job = await loadRustdeskJob();
+    } catch {
+      job = null;
+      state.rustdeskJobId = "";
+      localStorage.removeItem("ctyun:rustdeskJobId");
+    }
+  }
+  if (!isActiveRender(seq)) return;
+  content.innerHTML = `
+    <div class="rustdesk-layout">
+      <section class="panel rustdesk-form-panel">
+        <div class="panel-head"><div><h3>RustDesk 定制源码生成</h3><p class="muted">token 只用于本次任务，不保存数据库，不写日志。</p></div></div>
+        <form id="rustdeskForm" class="rustdesk-form">
+          <div class="form-grid">
+            <label>GitHub 公开仓库<input name="repo" placeholder="owner/repo 或 https://github.com/owner/repo" required></label>
+            <label>Personal access token classic<input name="token" type="password" autocomplete="off" placeholder="仅需 public_repo + workflow" required></label>
+            <label>RustDesk 官方版本<input name="rustdesk_version" placeholder="例如 1.4.7" required></label>
+            <label>目标分支<input name="target_branch" placeholder="留空使用仓库默认分支"></label>
+            <label>ID 服务器<input name="id_server" placeholder="例如 hbbs.example.com" required></label>
+            <label>RS_PUB_KEY<input name="rs_pub_key" autocomplete="off" required></label>
+            <label>中继服务器<input name="relay_server" placeholder="可选，留空使用默认逻辑"></label>
+            <label>API 服务器<input name="api_server" placeholder="留空则 http://ID服务器:21114"></label>
+            <label>默认密码<input name="default_password" type="password" autocomplete="new-password" placeholder="可选"></label>
+            <label>提交说明<input name="commit_message" placeholder="留空自动生成"></label>
+            <label class="checkbox-field wide"><input name="allow_remote_config_modification" type="checkbox" checked>允许远程修改配置</label>
+            <label class="checkbox-field wide"><input name="hide_cm" type="checkbox" checked>隐藏“自建服务器”跳转入口</label>
+          </div>
+          <details class="rustdesk-advanced">
+            <summary>关于页面选项（可选）</summary>
+            <div class="form-grid">
+              <label>关于页标题<input name="about_title"></label>
+              <label>产品名<input name="about_product_name"></label>
+              <label>服务商名称<input name="about_vendor_name"></label>
+              <label>支持链接<input name="about_support_url"></label>
+              <label>隐私链接<input name="about_privacy_url"></label>
+              <label class="checkbox-field wide"><input name="about_show_official_link" type="checkbox" checked>显示官方 RustDesk 链接</label>
+              <label class="checkbox-field wide"><input name="about_show_license_text" type="checkbox" checked>保留开源许可证文本</label>
+            </div>
+          </details>
+          <div class="inline-notice">
+            <div>当前方案按 RustDesk 1.4.7 成功路径实现：服务器信息写源码常量，删除 <code>res/local_custom_client.json</code>，并把子模块本地化。</div>
+            <div>目标仓库必须是公开仓库；classic token 请只勾选 <code>public_repo</code> 和 <code>workflow</code>。</div>
+          </div>
+          <div id="rustdeskError" class="form-error"></div>
+          <div class="dialog-actions rustdesk-actions"><button id="rustdeskSubmitBtn" class="primary" type="submit">开始写入目标仓库</button></div>
+        </form>
+      </section>
+      <section class="panel rustdesk-status-panel">
+        <div class="panel-head"><div><h3>执行状态</h3><p class="muted">拉源码和推送可能需要数分钟，期间不要重复提交。</p></div><button id="rustdeskRefreshBtn" type="button">刷新状态</button></div>
+        <div id="rustdeskJobPanel">${renderRustdeskJob(job)}</div>
+      </section>
+    </div>`;
+  $("#rustdeskForm").onsubmit = submitRustdeskCustomize;
+  $("#rustdeskRefreshBtn").onclick = async () => {
+    if (!state.rustdeskJobId) return toast("暂无任务");
+    const current = await loadRustdeskJob();
+    $("#rustdeskJobPanel").innerHTML = renderRustdeskJob(current);
+    if (!["success", "failed"].includes(current.status)) startRustdeskPolling(current.id);
+  };
+  if (job && !["success", "failed"].includes(job.status)) startRustdeskPolling(job.id);
 }
 
 function flattenIkuaiMenus(groups = []) {
@@ -2455,6 +2643,7 @@ async function render() {
   if (state.view === "vpc") return renderVpcNetwork(seq);
   if (state.view === "image") return renderImages(seq);
   if (state.view === "ikuai") return renderIkuai(seq);
+  if (state.view === "rustdesk") return renderRustdesk(seq);
   if (["ecs", "eip"].includes(state.view)) return renderResources(state.view, seq);
   if (state.view === "recycle") return renderRecycle(seq);
   return renderOperations(seq);

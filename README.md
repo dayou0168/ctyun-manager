@@ -9,6 +9,7 @@
 - 天翼云官方充值流程集成，支持微信、支付宝、翼支付二维码。
 - 充值二维码刷新、支付状态轮询、支付成功后余额强制刷新。
 - 爱快网关管理模块，按爱快 3.7+ UI 菜单映射主要功能。
+- RustDesk 定制工具：填写公开 GitHub 仓库、classic token、官方版本和服务器配置后，自动生成定制源码并推送到目标仓库。
 - 服务端后台预热天翼云充值页，减少首冲打开等待。
 
 ## 重要安全说明
@@ -172,6 +173,28 @@ curl -fsSL https://raw.githubusercontent.com/dayou0168/ctyun-manager/main/instal
 ```
 
 安装后请编辑 `.env`，修改 `CTYUN_MANAGER_ADMIN_PASSWORD`，然后重启服务。
+
+## RustDesk 定制工具
+
+平台左侧进入 `应用工具 / RustDesk 定制`。
+
+要求：
+
+- 目标仓库必须是 GitHub 公开仓库。
+- 使用 Personal access token classic。
+- token 只需要 `public_repo` 和 `workflow`，不要勾选 `repo`。
+- token 只在本次后台任务中使用，不保存数据库，不写入日志。
+- RustDesk 版本填写官方 tag，例如 `1.4.7`。
+
+流程：
+
+1. 校验 GitHub 仓库、token 权限和 RustDesk 官方 tag。
+2. 拉取官方 RustDesk 指定 tag。
+3. 本地化子模块，尤其 `libs/hbb_common`。
+4. 写入服务器、Key、默认密码等定制项到源码。
+5. 删除 `res/local_custom_client.json` 方案，避免 UI 显示内置服务器值。
+6. 推送到用户填写的公开仓库。
+7. 用户到目标仓库 Actions 中编译客户端。
 
 ## Codex 续接
 
