@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -157,6 +157,22 @@ def run_command(
     if output:
         progress(output[-1800:])
     return output
+
+
+def token_redactions(token: str) -> list[str]:
+    encoded = quote(token or "", safe="")
+    return [value for value in [token, encoded] if value]
+
+
+def authenticated_clone_url(repo: GitHubRepo, token: str) -> str:
+    encoded = quote(token, safe="")
+    return f"https://x-access-token:{encoded}@github.com/{repo.owner}/{repo.name}.git"
+
+
+def git_noninteractive_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def validate_rustdesk_tag(version: str, progress: Callable[[str], None]) -> str:
@@ -438,29 +454,6 @@ def copy_source_to_target(source_dir: Path, target_dir: Path) -> None:
             shutil.copy2(item, dest)
 
 
-def create_askpass_script(work_dir: Path, token: str) -> Path:
-    path = work_dir / "askpass.py"
-    path.write_text(
-        "import os, sys\n"
-        "prompt = ' '.join(sys.argv[1:]).lower()\n"
-        "if 'username' in prompt:\n"
-        "    print('x-access-token')\n"
-        "else:\n"
-        "    print(os.environ.get('GITHUB_TOKEN_FOR_ASKPASS', ''))\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    return path
-
-
-def git_env(token: str, askpass: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    env["GIT_ASKPASS"] = str(askpass)
-    env["GITHUB_TOKEN_FOR_ASKPASS"] = token
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
-
 def commit_and_push_target(
     repo: GitHubRepo,
     target_dir: Path,
@@ -468,12 +461,12 @@ def commit_and_push_target(
     payload: dict[str, Any],
     progress: Callable[[str], None],
 ) -> dict[str, Any]:
-    askpass = create_askpass_script(target_dir.parent, token)
-    env = git_env(token, askpass)
+    env = git_noninteractive_env()
+    redactions = token_redactions(token)
     branch = payload.get("target_branch") or repo.default_branch or "main"
-    run_command(["git", "checkout", "-B", branch], cwd=target_dir, env=env, progress=progress, redact=[token], timeout=60)
-    run_command(["git", "add", "-A"], cwd=target_dir, env=env, progress=progress, redact=[token], timeout=300)
-    status = run_command(["git", "status", "--porcelain"], cwd=target_dir, env=env, progress=progress, redact=[token], timeout=60)
+    run_command(["git", "checkout", "-B", branch], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=60)
+    run_command(["git", "add", "-A"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=300)
+    status = run_command(["git", "status", "--porcelain"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=60)
     if not status.strip():
         progress("目标仓库没有产生新的文件差异")
         return {"pushed": False, "branch": branch, "url": repo.html_url}
@@ -482,7 +475,7 @@ def commit_and_push_target(
         cwd=target_dir,
         env=env,
         progress=progress,
-        redact=[token],
+        redact=redactions,
         timeout=30,
     )
     run_command(
@@ -490,12 +483,20 @@ def commit_and_push_target(
         cwd=target_dir,
         env=env,
         progress=progress,
-        redact=[token],
+        redact=redactions,
         timeout=30,
     )
     message = (payload.get("commit_message") or "").strip() or f"Customize RustDesk {payload['rustdesk_version']}"
-    run_command(["git", "commit", "-m", message], cwd=target_dir, env=env, progress=progress, redact=[token], timeout=300)
-    run_command(["git", "push", "origin", branch], cwd=target_dir, env=env, progress=progress, redact=[token], timeout=600)
+    run_command(["git", "commit", "-m", message], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=300)
+    run_command(
+        ["git", "remote", "set-url", "origin", authenticated_clone_url(repo, token)],
+        cwd=target_dir,
+        env=env,
+        progress=progress,
+        redact=redactions,
+        timeout=60,
+    )
+    run_command(["git", "push", "origin", branch], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=600)
     return {"pushed": True, "branch": branch, "url": repo.html_url}
 
 
@@ -525,8 +526,8 @@ def customize_rustdesk(payload: dict[str, Any], progress: Callable[[str], None])
         tmp_path = Path(tmp)
         source_dir = tmp_path / "rustdesk-source"
         target_dir = tmp_path / "target-repo"
-        askpass = create_askpass_script(tmp_path, token)
-        env = git_env(token, askpass)
+        env = git_noninteractive_env()
+        redactions = token_redactions(token)
 
         progress(f"正在拉取 RustDesk 官方源码 tag {tag}...")
         run_command(
@@ -550,10 +551,10 @@ def customize_rustdesk(payload: dict[str, Any], progress: Callable[[str], None])
 
         progress("正在拉取目标公开仓库...")
         run_command(
-            ["git", "clone", repo.clone_url, str(target_dir)],
+            ["git", "clone", authenticated_clone_url(repo, token), str(target_dir)],
             env=env,
             progress=progress,
-            redact=[token],
+            redact=redactions,
             timeout=600,
         )
         progress("正在写入定制后的 RustDesk 源码...")

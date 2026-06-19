@@ -52,7 +52,7 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - 拉取官方源码、递归子模块、本地化子模块、应用源码补丁、推送到目标仓库。
   - 采用 1.4.7 成功方案：服务器信息写源码常量，不使用 `res/local_custom_client.json`。
 - 本地版本：
-  - 当前构建：`2026.06.19.2153`
+  - 当前构建：`2026.06.19.2319`
   - 本地验证地址：`http://127.0.0.1:8000/`
 - 部署方式：
   - Linux 服务器直装远程入口：`install-linux.sh`
@@ -119,6 +119,7 @@ requirements.txt                  Python 依赖
 - 发布版 Docker Compose 使用命名卷 `ctyun-manager-data` 持久化 `/app/data`，迁移时必须备份该 volume 内的 `master.key` 和 SQLite 数据库。
 - 本地源码 Docker Compose 仍保留 `docker-compose.yml`，它使用 `build:` 从当前源码构建镜像，并把本地 `./data` 挂载到容器 `/app/data`。
 - RustDesk 定制不使用数据库保存 token。任务状态只保存在进程内存，服务重启后历史任务会丢失。若用户只能创建带 `repo` 权限的 classic token，建议任务完成后立即删除该 token。
+- RustDesk GitHub 写入使用临时 authenticated HTTPS remote，不依赖 `GIT_ASKPASS`，避免服务器 `/tmp` 权限或 noexec 导致 `git push` 无法读取用户名。
 - RustDesk 1.4.7 方案：
   - `libs/hbb_common/src/config.rs` 写 `RENDEZVOUS_SERVERS` 和 `RS_PUB_KEY`。
   - `src/common.rs` 在 `load_custom_client()` 中写入 `config::HARD_SETTINGS`。
@@ -128,7 +129,7 @@ requirements.txt                  Python 依赖
 ## 当前待办
 
 - 公网 `http://43.119.30.80:8000/` 需要部署最新包后才会更新。
-  - 最近一次本地版本：`2026.06.19.2153`
+  - 最近一次本地版本：`2026.06.19.2319`
   - 之前公网曾停留在旧版本，部署后应先检查 `/api/version`。
 - 继续实测支付成功后：
   - 平台弹窗是否显示成功页。
