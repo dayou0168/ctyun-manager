@@ -2,10 +2,12 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
@@ -39,6 +41,64 @@ def compact(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if item not in (None, "", [])}
 
 
+def unique_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        body = compact(payload)
+        signature = json.dumps(
+            {key: value for key, value in body.items() if key != "clientToken"},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(body)
+    return result
+
+
+def parse_ctyun_time(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "0"}:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        timestamp = float(text)
+        return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+    candidates = [text]
+    if text.endswith("Z"):
+        candidates.append(text[:-1] + "+00:00")
+    if " " in text and "T" not in text:
+        candidates.append(text.replace(" ", "T"))
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def ecs_expired_time(item: dict[str, Any]) -> tuple[str, bool]:
+    expired_time = first_present(
+        item.get("expiredTime"),
+        item.get("expireTime"),
+        item.get("expirationTime"),
+        item.get("expiredAt"),
+        item.get("expireAt"),
+        item.get("endTime"),
+    )
+    timestamp = parse_ctyun_time(expired_time)
+    return str(expired_time or ""), bool(timestamp and timestamp <= time.time())
+
+
 def as_bool(value: Any, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -68,6 +128,130 @@ def split_csv(value: Any) -> list[str]:
     for sep in ["\r\n", "\n", "，", "；", ";"]:
         text = text.replace(sep, ",")
     return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def csv_text(value: Any) -> str:
+    return ",".join(split_csv(value))
+
+
+def subnet_dns_values(payload: dict[str, Any]) -> list[str]:
+    return split_csv(
+        payload.get("dnsList")
+        or payload.get("dns")
+        or payload.get("dnsServers")
+        or payload.get("dnsServerList")
+    )
+
+
+def sg_rule_direction(value: Any, default: str = "ingress") -> str:
+    text = str(value or "").strip().lower()
+    if text in {"egress", "out", "outbound", "出口", "出方向", "1"}:
+        return "egress"
+    if text in {"ingress", "in", "inbound", "入口", "入方向", "0"}:
+        return "ingress"
+    return default
+
+
+def sg_rule_id(payload: dict[str, Any]) -> str:
+    return first_present(
+        payload.get("securityGroupRuleID"),
+        payload.get("securityGroupRuleId"),
+        payload.get("security_group_rule_id"),
+        payload.get("ruleID"),
+        payload.get("ruleId"),
+        payload.get("id"),
+        payload.get("ID"),
+    )
+
+
+def sg_rule_body(payload: dict[str, Any], direction: str) -> dict[str, Any]:
+    protocol = str(payload.get("protocol") or "ANY").strip().upper()
+    ethertype = str(payload.get("ethertype") or payload.get("etherType") or "").strip()
+    cidr = first_present(
+        payload.get("destCidrIp"),
+        payload.get("sourceCidrIp"),
+        payload.get("remoteIpPrefix"),
+        payload.get("remoteIPPrefix"),
+        payload.get("cidr"),
+    )
+    if not ethertype:
+        ethertype = "IPv6" if ":" in cidr else "IPv4"
+    if not cidr:
+        cidr = "::/0" if ethertype == "IPv6" else "0.0.0.0/0"
+    rule = {
+        "direction": direction,
+        "action": payload.get("ruleAction") or payload.get("action") or "accept",
+        "protocol": protocol,
+        "ethertype": ethertype,
+        "destCidrIp": cidr,
+        "remoteType": as_int(payload.get("remoteType"), 0),
+        "priority": as_int(payload.get("priority"), 100),
+        "description": payload.get("description"),
+        "range": payload.get("range") or payload.get("portRange"),
+    }
+    if protocol in {"ANY", "ICMP", "ICMP6"} and not rule["range"]:
+        rule.pop("range", None)
+    return compact(rule)
+
+
+def collect_sg_rule_ids(value: Any) -> list[str]:
+    result: list[str] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in {"securityGroupRuleID", "securityGroupRuleId", "ruleID", "ruleId"}:
+                    text = str(child or "").strip()
+                    if text and text not in result:
+                        result.append(text)
+                else:
+                    walk(child)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child)
+
+    walk(value)
+    return result
+
+
+def eip_binding_status(item: dict[str, Any], instance_info: list[Any]) -> str:
+    raw_status = first_present(
+        item.get("bindStatus"),
+        item.get("bindingStatus"),
+        item.get("associateStatus"),
+        item.get("associationStatus"),
+        item.get("bind_status"),
+        item.get("association_status"),
+        item.get("status"),
+        item.get("state"),
+    ).lower()
+    if re.search(r"unbinding|detach|free|idle|unbound|unbind|未绑定|空闲", raw_status):
+        return "unbound"
+    if re.search(r"binding|binded|bound|attach|associate|in[-_ ]?use|using|used|绑定|使用", raw_status):
+        return "bound"
+    binding_values = [
+        item.get("associationID"),
+        item.get("associationId"),
+        item.get("association_id"),
+        item.get("associationType"),
+        item.get("association_type"),
+        item.get("instanceID"),
+        item.get("instanceId"),
+        item.get("instance_id"),
+        item.get("instanceName"),
+        item.get("serverID"),
+        item.get("serverId"),
+        item.get("deviceID"),
+        item.get("deviceId"),
+        item.get("bindID"),
+        item.get("bindId"),
+    ]
+    has_binding_value = any(
+        str(value or "").strip() and str(value or "").strip() not in {"0", "-"}
+        for value in binding_values
+    )
+    has_instance_info = any(isinstance(value, dict) and value for value in instance_info)
+    return "bound" if has_binding_value or has_instance_info else "unbound"
 
 
 def first_present(*values: Any) -> str:
@@ -279,6 +463,25 @@ class CtyunOpenApiClient:
         fixed_ip_list = item.get("fixedIpList") if isinstance(item.get("fixedIpList"), list) else []
         instance_info = item.get("instanceInfo") if isinstance(item.get("instanceInfo"), list) else []
         network_info = item.get("networkInfo") if isinstance(item.get("networkInfo"), list) else []
+        bound_eip_ids: list[str] = []
+        bound_eip_addresses: list[str] = []
+        for info in network_info:
+            if not isinstance(info, dict):
+                continue
+            eip_id = first_present(info.get("eipID"), info.get("eipId"), info.get("floatingID"), info.get("floatingId"), info.get("id"))
+            eip_address = first_present(
+                info.get("eipAddress"),
+                info.get("publicIP"),
+                info.get("publicIp"),
+                info.get("public_ip"),
+                info.get("floatingIP"),
+                info.get("floatingIp"),
+                info.get("ip"),
+            )
+            if eip_id:
+                bound_eip_ids.append(str(eip_id))
+            if eip_address:
+                bound_eip_addresses.append(str(eip_address))
         image_visibility = (
             item.get("imageVisibilityCode")
             if item.get("imageVisibilityCode") is not None
@@ -313,16 +516,34 @@ class CtyunOpenApiClient:
             or first_card.get("IPv4Address") or (fixed_ip_list[0] if fixed_ip_list else "")
             or self._extract_address(item, "private")
         )
+        raw_status_value = str(
+            item.get("status")
+            or item.get("state")
+            or item.get("instanceStatus")
+            or item.get("imageStatus")
+            or ""
+        )
+        status_value = raw_status_value
+        expired_time = ""
+        is_expired = False
+        if fallback_type == "ecs":
+            expired_time, is_expired = ecs_expired_time(item)
+            if is_expired:
+                status_value = "expired"
+        eip_bind_state = ""
+        if fallback_type == "eip":
+            eip_bind_state = eip_binding_status(item, instance_info)
+            if not status_value or re.search(r"bound|binded|unbound|unbinded|free|idle|attached|associated|使用|绑定|未绑定|空闲", status_value, re.I):
+                status_value = eip_bind_state
         normalized = {
             "id": str(rid or ""),
             "name": str(name or ""),
-            "status": str(
-                item.get("status")
-                or item.get("state")
-                or item.get("instanceStatus")
-                or item.get("imageStatus")
-                or ""
-            ),
+            "status": status_value,
+            "official_status": raw_status_value,
+            "expired_time": expired_time,
+            "is_expired": is_expired,
+            "release_time": item.get("releaseTime") or item.get("releasedTime") or "",
+            "binding_status": eip_bind_state,
             "region": actual_region_id,
             "region_name": self._region_name(actual_region_id),
             "billing_mode": str(item.get("billingMode") or item.get("cycleType") or item.get("chargeType") or ""),
@@ -336,7 +557,8 @@ class CtyunOpenApiClient:
             "subnet_id": item.get("subnetID") or item.get("subnetId") or "",
             "network_card_id": first_card.get("networkCardID") or item.get("networkInterfaceID") or "",
             "bound_instances": ", ".join(filter(None, [x.get("instanceName") or x.get("id") for x in instance_info if isinstance(x, dict)])),
-            "bound_eips": ", ".join(filter(None, [x.get("eipID") for x in network_info if isinstance(x, dict)])),
+            "bound_eips": ", ".join(bound_eip_addresses or bound_eip_ids),
+            "bound_eip_ids": ", ".join(bound_eip_ids),
             "image_type": item.get("imageType") or item.get("image_type") or "",
             "os": (
                 os_info.get("nameZh") or os_info.get("nameEn") or os_info.get("osType")
@@ -1096,8 +1318,16 @@ class CtyunOpenApiClient:
                     nic_ids = self._live_network_interface_id_candidates(region_id, instance_id, payload)
                 if not nic_ids:
                     raise CtyunClientError("未识别到云主机主网卡 ID，请先同步云主机资源，或在弹窗里手动填写网卡ID。")
+                cached = payload.get("_cached") if isinstance(payload.get("_cached"), dict) else {}
                 subnet_id = payload.get("subnetID") or payload.get("subnetId")
                 private_ip = payload.get("privateIP") or payload.get("privateIp") or payload.get("ipAddress")
+                cached_private_ip = cached.get("private_ip") or cached.get("privateIP") or cached.get("privateIp") or cached.get("ipAddress")
+                if action == "change_private_ip" and not private_ip:
+                    raise CtyunClientError("修改内网IP需要填写新的内网IP。")
+                if action == "change_private_ip" and private_ip and cached_private_ip and str(private_ip) == str(cached_private_ip):
+                    raise CtyunClientError("新内网IP与当前内网IP相同，请填写目标子网内未占用的新 IP。")
+                if action == "change_vpc" and private_ip and cached_private_ip and str(private_ip) == str(cached_private_ip):
+                    private_ip = None
                 vpc_id = payload.get("vpcID") or payload.get("vpcId")
                 security_group_id = payload.get("securityGroupID") or payload.get("securityGroupId") or payload.get("secGroupList")
                 security_group_ids = split_csv(payload.get("securityGroupIDList") or payload.get("securityGroupIDs") or security_group_id)
@@ -1108,22 +1338,35 @@ class CtyunOpenApiClient:
                 errors: list[str] = []
                 for nic_id in nic_ids:
                     if action == "change_private_ip":
-                        variants = [
-                            compact({"regionID": region_id, "networkInterfaceID": nic_id, "subnetID": subnet_id, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "portID": nic_id, "subnetID": subnet_id, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "networkInterfaceID": nic_id, "subnetID": subnet_id, "ipAddress": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "portID": nic_id, "subnetID": subnet_id, "ipAddress": private_ip, "clientToken": str(uuid.uuid4())}),
-                        ]
+                        base = {"regionID": region_id, "instanceID": instance_id, "subnetID": subnet_id}
+                        ip_payloads = [{}]
+                        if private_ip:
+                            ip_payloads = [
+                                {"privateIP": private_ip},
+                                {"privateIp": private_ip},
+                                {"ipAddress": private_ip},
+                                {"newPrivateIP": private_ip},
+                                {"fixedIP": private_ip},
+                            ]
+                        variants = unique_payloads([
+                            {**base, nic_key: nic_id, **ip_body, "clientToken": str(uuid.uuid4())}
+                            for nic_key in ("networkInterfaceID", "networkCardID", "portID")
+                            for ip_body in ip_payloads
+                        ])
                         path_options = ["/v4/ports/change-private-ip", "/v4/ecs/ports/change-private-ip"]
                     else:
-                        variants = [
-                            compact({"regionID": region_id, "networkInterfaceID": nic_id, "vpcID": vpc_id, "subnetID": subnet_id, "securityGroupIDList": security_group_ids, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "portID": nic_id, "vpcID": vpc_id, "subnetID": subnet_id, "securityGroupIDList": security_group_ids, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "networkInterfaceID": nic_id, "vpcID": vpc_id, "subnetID": subnet_id, "securityGroupIDs": security_group_ids, "ipAddress": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "portID": nic_id, "vpcID": vpc_id, "subnetID": subnet_id, "securityGroupIDs": security_group_ids, "ipAddress": private_ip, "clientToken": str(uuid.uuid4())}),
-                            compact({"regionID": region_id, "networkInterfaceID": nic_id, "vpcID": vpc_id, "subnetID": subnet_id, "securityGroupID": security_group_ids[0] if security_group_ids else None, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}),
-                        ]
-                        path_options = ["/v4/ports/change-vpc", "/v4/ecs/ports/change-vpc"]
+                        base = {"regionID": region_id, "instanceID": instance_id, "vpcID": vpc_id, "subnetID": subnet_id}
+                        variants = unique_payloads([
+                            {**base, nic_key: nic_id, "securityGroupIDList": security_group_ids, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}
+                            for nic_key in ("networkInterfaceID", "networkCardID", "portID")
+                        ] + [
+                            {**base, nic_key: nic_id, "securityGroupIDs": security_group_ids, "ipAddress": private_ip, "clientToken": str(uuid.uuid4())}
+                            for nic_key in ("networkInterfaceID", "networkCardID", "portID")
+                        ] + [
+                            {**base, nic_key: nic_id, "securityGroupID": security_group_ids[0] if security_group_ids else None, "privateIP": private_ip, "clientToken": str(uuid.uuid4())}
+                            for nic_key in ("networkInterfaceID", "networkCardID", "portID")
+                        ])
+                        path_options = ["/v4/ports/change-vpc"]
                     for endpoint in [settings.vpc_endpoint, settings.ecs_endpoint]:
                         for path in path_options:
                             for body in variants:
@@ -1241,6 +1484,7 @@ class CtyunOpenApiClient:
                     raise CtyunClientError("创建 VPC 需要 name 和 CIDR。")
                 return self._post_action(settings.vpc_endpoint, "/v4/vpc/create", body)
             if action == "create_subnet":
+                dns_values = subnet_dns_values(payload)
                 body = compact({
                     "regionID": region_id,
                     "clientToken": str(uuid.uuid4()),
@@ -1249,7 +1493,8 @@ class CtyunOpenApiClient:
                     "CIDR": payload.get("CIDR") or payload.get("cidr"),
                     "description": payload.get("description"),
                     "enableIpv6": as_bool(payload.get("enableIpv6"), False),
-                    "dnsList": split_csv(payload.get("dnsList")),
+                    "dnsList": dns_values,
+                    "dnsServers": dns_values,
                     "subnetGatewayIP": payload.get("subnetGatewayIP") or payload.get("gatewayIP"),
                     "subnetType": payload.get("subnetType") or "common",
                     "projectID": payload.get("projectID") or "0",
@@ -1281,12 +1526,14 @@ class CtyunOpenApiClient:
             if not subnet_id:
                 raise CtyunClientError("子网操作需要 subnetID。")
             if action == "update":
+                dns_values = subnet_dns_values(payload)
                 return self._post_action(settings.subnet_endpoint, "/v4/vpc/update-subnet", compact({
                     "regionID": region_id,
                     "subnetID": subnet_id,
                     "name": payload.get("name"),
                     "description": payload.get("description"),
-                    "dnsList": split_csv(payload.get("dnsList")),
+                    "dnsList": dns_values,
+                    "dnsServers": dns_values,
                 }))
             if action == "delete":
                 return self._post_action(
@@ -1322,20 +1569,8 @@ class CtyunOpenApiClient:
                     "enabled": as_bool(payload.get("enabled"), True),
                 }))
             if action == "create_rule":
-                direction = payload.get("direction") or "ingress"
-                if direction not in {"ingress", "egress"}:
-                    raise CtyunClientError("安全组规则方向无效。")
-                rule = compact({
-                    "direction": direction,
-                    "action": payload.get("ruleAction") or "accept",
-                    "protocol": payload.get("protocol") or "ANY",
-                    "ethertype": payload.get("ethertype") or "IPv4",
-                    "destCidrIp": payload.get("destCidrIp") or ("0.0.0.0/0" if payload.get("ethertype") != "IPv6" else "::/0"),
-                    "remoteType": 0,
-                    "priority": as_int(payload.get("priority"), 100),
-                    "description": payload.get("description"),
-                    "range": payload.get("range"),
-                })
+                direction = sg_rule_direction(payload.get("direction"))
+                rule = sg_rule_body(payload, direction)
                 return self._post_action(
                     settings.vpc_endpoint,
                     f"/v4/vpc/create-security-group-{direction}",
@@ -1346,10 +1581,69 @@ class CtyunOpenApiClient:
                         "clientToken": str(uuid.uuid4()),
                     },
                 )
+            if action == "update_rule":
+                old_direction = sg_rule_direction(payload.get("oldDirection") or payload.get("direction"))
+                direction = sg_rule_direction(payload.get("direction"), old_direction)
+                rule_id = sg_rule_id(payload)
+                if not rule_id:
+                    raise CtyunClientError("修改安全组规则需要 securityGroupRuleID。")
+                rule = sg_rule_body(payload, direction)
+                create_body = {
+                    "regionID": region_id,
+                    "securityGroupID": security_group_id,
+                    "securityGroupRules": [rule],
+                    "clientToken": str(uuid.uuid4()),
+                }
+                delete_body = {
+                    "regionID": region_id,
+                    "securityGroupID": security_group_id,
+                    "securityGroupRuleID": rule_id,
+                    "clientToken": str(uuid.uuid4()),
+                }
+                try:
+                    create_result = self._post_action(
+                        settings.vpc_endpoint,
+                        f"/v4/vpc/create-security-group-{direction}",
+                        create_body,
+                    )
+                    try:
+                        self._post_action(
+                            settings.vpc_endpoint,
+                            f"/v4/vpc/revoke-security-group-{old_direction}",
+                            delete_body,
+                        )
+                    except CtyunClientError as delete_exc:
+                        rollback_errors: list[str] = []
+                        for new_rule_id in collect_sg_rule_ids(create_result):
+                            try:
+                                self._post_action(
+                                    settings.vpc_endpoint,
+                                    f"/v4/vpc/revoke-security-group-{direction}",
+                                    {**delete_body, "securityGroupRuleID": new_rule_id, "clientToken": str(uuid.uuid4())},
+                                )
+                            except CtyunClientError as rollback_exc:
+                                rollback_errors.append(str(rollback_exc))
+                        extra = f"；新规则回滚失败：{'；'.join(rollback_errors)}" if rollback_errors else "；已尝试回滚新规则"
+                        raise CtyunClientError(f"新安全组规则已创建，但删除旧规则失败：{delete_exc}{extra}") from delete_exc
+                    return create_result
+                except CtyunClientError as exc:
+                    message = str(exc).lower()
+                    if not any(text in message for text in ("duplicate", "already", "exist", "重复", "已存在")):
+                        raise
+                    self._post_action(
+                        settings.vpc_endpoint,
+                        f"/v4/vpc/revoke-security-group-{old_direction}",
+                        delete_body,
+                    )
+                    return self._post_action(
+                        settings.vpc_endpoint,
+                        f"/v4/vpc/create-security-group-{direction}",
+                        create_body,
+                    )
             if action == "delete_rule":
-                direction = payload.get("direction") or "ingress"
-                rule_id = payload.get("securityGroupRuleID")
-                if direction not in {"ingress", "egress"} or not rule_id:
+                direction = sg_rule_direction(payload.get("direction"))
+                rule_id = sg_rule_id(payload)
+                if not rule_id:
                     raise CtyunClientError("删除安全组规则需要规则方向和规则。")
                 return self._post_action(
                     settings.vpc_endpoint,

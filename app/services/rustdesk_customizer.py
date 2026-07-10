@@ -4,7 +4,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import base64
+import binascii
+import io
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -19,6 +23,33 @@ SENSITIVE_WORKFLOW_KEYS = {
     "RELAY_SERVER",
     "API_SERVER",
     "RS_PUB_KEY",
+}
+RUSTDESK_BUILD_TARGETS: tuple[dict[str, str], ...] = (
+    {"id": "windows_x64", "input": "build_windows_x64", "label": "Windows 64 位"},
+    {"id": "windows_x86", "input": "build_windows_x86", "label": "Windows 32 位"},
+    {"id": "android", "input": "build_android", "label": "Android APK"},
+    {"id": "macos", "input": "build_macos", "label": "macOS"},
+    {"id": "ios", "input": "build_ios", "label": "iOS IPA"},
+    {"id": "linux", "input": "build_linux", "label": "Linux 桌面包"},
+    {"id": "linux_sciter", "input": "build_linux_sciter", "label": "Linux Sciter 兼容包"},
+    {"id": "appimage", "input": "build_appimage", "label": "AppImage"},
+    {"id": "flatpak", "input": "build_flatpak", "label": "Flatpak"},
+)
+RUSTDESK_DEFAULT_BUILD_TARGETS = tuple(item["id"] for item in RUSTDESK_BUILD_TARGETS)
+RUSTDESK_BUILD_TARGET_LABELS = {item["id"]: item["label"] for item in RUSTDESK_BUILD_TARGETS}
+RUSTDESK_BUILD_TARGET_INPUTS = {item["id"]: item["input"] for item in RUSTDESK_BUILD_TARGETS}
+MAX_ICON_UPLOAD_BYTES = 5 * 1024 * 1024
+RELEASE_UPLOAD_TAG_LINE = "      upload-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+# Do not replace rustdesk-org/run-on-arch-action: RustDesk's fork bundles the
+# Dockerfiles used by Linux Sciter and Flatpak jobs.
+NODE24_WORKFLOW_ACTIONS: dict[str, tuple[str, str, str]] = {
+    "actions/cache": ("actions/cache", "27d5ce7f107fe9357f9df03efb73ab90386fccae", "v5.0.5"),
+    "actions/checkout": ("actions/checkout", "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0", "v7.0.0"),
+    "actions/download-artifact": ("actions/download-artifact", "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", "v8.0.1"),
+    "actions/github-script": ("actions/github-script", "3a2844b7e9c422d3c10d287c895573f7108da1b3", "v9.0.0"),
+    "actions/upload-artifact": ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7.0.1"),
+    "microsoft/setup-msbuild": ("microsoft/setup-msbuild", "30375c66a4eea26614e0d39710365f22f8b0af57", "v3.0.0"),
+    "softprops/action-gh-release": ("softprops/action-gh-release", "718ea10b132b3b2eba29c1007bb80653f286566b", "v3.0.1"),
 }
 
 
@@ -164,6 +195,43 @@ def token_redactions(token: str) -> list[str]:
     return [value for value in [token, encoded] if value]
 
 
+def normalize_build_targets(payload: dict[str, Any]) -> list[str]:
+    raw = payload.get("build_targets")
+    if not raw:
+        return list(RUSTDESK_DEFAULT_BUILD_TARGETS)
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(item).strip() for item in raw if str(item).strip()]
+    else:
+        raise RustDeskCustomizeError("编译客户端选择格式不正确")
+    allowed = set(RUSTDESK_DEFAULT_BUILD_TARGETS)
+    invalid = [item for item in values if item not in allowed]
+    if invalid:
+        raise RustDeskCustomizeError(f"不支持的编译客户端：{'、'.join(invalid)}")
+    selected = [item for item in RUSTDESK_DEFAULT_BUILD_TARGETS if item in set(values)]
+    if not selected:
+        raise RustDeskCustomizeError("请至少选择一个需要编译的客户端")
+    return selected
+
+
+def build_target_labels(targets: list[str]) -> list[str]:
+    return [RUSTDESK_BUILD_TARGET_LABELS.get(item, item) for item in targets]
+
+
+def sanitize_release_tag(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    cleaned = cleaned.strip(".-")
+    return cleaned or "rustdesk-custom"
+
+
+def default_release_tag(payload: dict[str, Any]) -> str:
+    version = str(payload.get("rustdesk_version") or "custom").strip().lstrip("v")
+    version = re.sub(r"[^A-Za-z0-9._-]+", "-", version).strip(".-") or "custom"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    return sanitize_release_tag(f"rustdesk-{version}-{stamp}")
+
+
 def authenticated_clone_url(repo: GitHubRepo, token: str) -> str:
     encoded = quote(token, safe="")
     return f"https://x-access-token:{encoded}@github.com/{repo.owner}/{repo.name}.git"
@@ -172,6 +240,7 @@ def authenticated_clone_url(repo: GitHubRepo, token: str) -> str:
 def git_noninteractive_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
     return env
 
 
@@ -184,6 +253,7 @@ def validate_rustdesk_tag(version: str, progress: Callable[[str], None]) -> str:
     ref = f"refs/tags/{tag}"
     output = run_command(
         ["git", "ls-remote", "--tags", RUSTDESK_REPO_URL, ref],
+        env=git_noninteractive_env(),
         progress=progress,
         timeout=60,
     )
@@ -405,6 +475,398 @@ def remove_bundled_server_settings(source_dir: Path, progress: Callable[[str], N
     progress("已禁用 local_custom_client/default-settings 相关 workflow 逻辑")
 
 
+def patch_deprecated_workflow_actions(source_dir: Path, progress: Callable[[str], None]) -> None:
+    workflows_dir = source_dir / ".github" / "workflows"
+    if not workflows_dir.exists():
+        return
+    touched = 0
+    for path in list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        original = text
+        lines = []
+        for line in text.splitlines():
+            for action, (replacement, ref, version) in NODE24_WORKFLOW_ACTIONS.items():
+                if f"{action}@" not in line:
+                    continue
+                line = re.sub(
+                    rf"{re.escape(action)}@[^\s#]+",
+                    f"{replacement}@{ref}",
+                    line,
+                )
+                if "#" in line:
+                    line = re.sub(r"\s+#.*$", f" # {version}; Node 24", line)
+                else:
+                    line = f"{line} # {version}; Node 24"
+                break
+            lines.append(line)
+        text = "\n".join(lines) + "\n"
+        if text != original:
+            _write_text(path, text)
+            touched += 1
+    if touched:
+        progress(f"已升级 GitHub Actions Node 24 兼容动作：{touched} 个 workflow")
+
+
+def _set_job_if(text: str, job_name: str, expression: str) -> str:
+    lines = text.splitlines()
+    marker = f"  {job_name}:"
+    for index, line in enumerate(lines):
+        if line != marker:
+            continue
+        desired = f"    if: ${{{{ {expression} }}}}"
+        block_end = len(lines)
+        for probe in range(index + 1, len(lines)):
+            if lines[probe].startswith("  ") and not lines[probe].startswith("    ") and lines[probe].strip().endswith(":"):
+                block_end = probe
+                break
+        existing = [probe for probe in range(index + 1, block_end) if lines[probe].startswith("    if:")]
+        if existing:
+            lines[existing[0]] = desired
+            for duplicate in reversed(existing[1:]):
+                del lines[duplicate]
+        else:
+            lines.insert(index + 1, desired)
+        return "\n".join(lines) + "\n"
+    return text
+
+
+def _ensure_workflow_permissions(text: str) -> str:
+    if "\npermissions:\n" in f"\n{text}":
+        return text
+    block = (
+        "permissions:\n"
+        "  contents: write\n"
+        "  packages: write\n"
+        "  actions: read\n\n"
+    )
+    lines = text.splitlines()
+    insert_at = 1 if lines and lines[0].startswith("name:") else 0
+    lines[insert_at:insert_at] = block.rstrip("\n").splitlines()
+    return "\n".join(lines) + "\n"
+
+
+def _ensure_job_permissions(text: str, job_name: str) -> str:
+    lines = text.splitlines()
+    marker = f"  {job_name}:"
+    for index, line in enumerate(lines):
+        if line != marker:
+            continue
+        block_end = len(lines)
+        for probe in range(index + 1, len(lines)):
+            if lines[probe].startswith("  ") and not lines[probe].startswith("    ") and lines[probe].strip().endswith(":"):
+                block_end = probe
+                break
+        for probe in range(index + 1, block_end):
+            if lines[probe].startswith("    permissions:"):
+                return text
+        cursor = index + 1
+        if cursor < len(lines) and lines[cursor].startswith("    if:"):
+            cursor += 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        if cursor < len(lines) and lines[cursor].startswith("    permissions:"):
+            return text
+        block = [
+            "    permissions:",
+            "      contents: write",
+            "      packages: write",
+            "      actions: read",
+        ]
+        lines[cursor:cursor] = block
+        return "\n".join(lines) + "\n"
+    return text
+
+
+def _workflow_call_inputs_block() -> str:
+    blocks = []
+    for target in RUSTDESK_BUILD_TARGETS:
+        blocks.append(
+            f"      {target['input']}:\n"
+            "        type: boolean\n"
+            "        default: true"
+        )
+    return "\n".join(blocks)
+
+
+def _workflow_release_tag_input_block(release_tag: str) -> str:
+    return (
+        "      release_tag:\n"
+        "        description: \"Release 名称/标签（默认版本号+日期）\"\n"
+        "        type: string\n"
+        f"        default: \"{sanitize_release_tag(release_tag)}\""
+    )
+
+
+def _workflow_dispatch_target_inputs_block(selected_targets: list[str]) -> str:
+    selected = set(selected_targets)
+    blocks = []
+    for target in RUSTDESK_BUILD_TARGETS:
+        default = "true" if target["id"] in selected else "false"
+        blocks.append(
+            f"      {target['input']}:\n"
+            f"        description: \"{target['label']}\"\n"
+            "        type: boolean\n"
+            f"        default: {default}"
+        )
+    return "\n".join(blocks)
+
+
+def _workflow_dispatch_inputs_block(selected_targets: list[str], release_tag: str) -> str:
+    return "\n".join(
+        [
+            _workflow_release_tag_input_block(release_tag),
+            _workflow_dispatch_target_inputs_block(selected_targets),
+        ]
+    )
+
+
+def _workflow_tag_with_inputs_block() -> str:
+    lines = []
+    for target in RUSTDESK_BUILD_TARGETS:
+        input_name = target["input"]
+        lines.append(f"      {input_name}: ${{{{ github.event_name != 'workflow_dispatch' || inputs.{input_name} }}}}")
+    return "\n".join(lines)
+
+
+def _ensure_flutter_tag_dispatch_inputs(text: str, selected_targets: list[str], release_tag: str) -> str:
+    needs_release_tag = "      release_tag:" not in text
+    needs_build_targets = "      build_windows_x64:" not in text
+    if not needs_release_tag and not needs_build_targets:
+        return text
+    if "    inputs:\n" in text:
+        blocks = []
+        if needs_release_tag:
+            blocks.append(_workflow_release_tag_input_block(release_tag))
+        if needs_build_targets:
+            blocks.append(_workflow_dispatch_target_inputs_block(selected_targets))
+        block_text = "\n".join(blocks)
+        return text.replace(
+            "    inputs:\n",
+            "    inputs:\n"
+            f"{block_text}\n",
+            1,
+        )
+    return text.replace(
+        "  workflow_dispatch:\n",
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        f"{_workflow_dispatch_inputs_block(selected_targets, release_tag)}\n",
+        1,
+    )
+
+
+def _ensure_flutter_tag_call_inputs(text: str) -> str:
+    text = text.replace("      upload-tag: ${{ github.ref_name }}\n", f"{RELEASE_UPLOAD_TAG_LINE}\n", 1)
+    if "      build_windows_x64: ${{ github.event_name != 'workflow_dispatch' || inputs.build_windows_x64 }}" in text:
+        return text
+    return text.replace(
+        f"{RELEASE_UPLOAD_TAG_LINE}\n",
+        f"{RELEASE_UPLOAD_TAG_LINE}\n"
+        f"{_workflow_tag_with_inputs_block()}\n",
+        1,
+    )
+
+
+def patch_flutter_tag_workflow(source_dir: Path, selected_targets: list[str], release_tag: str) -> bool:
+    path = source_dir / ".github" / "workflows" / "flutter-tag.yml"
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    original = text
+    text = _ensure_workflow_permissions(text)
+    text = _ensure_job_permissions(text, "run-flutter-tag-build")
+    text = _ensure_flutter_tag_dispatch_inputs(text, selected_targets, release_tag)
+    text = _ensure_flutter_tag_call_inputs(text)
+    if text != original:
+        _write_text(path, text)
+        return True
+    return False
+
+
+def _patch_appimage_python_build_tools(text: str) -> str:
+    install_line = '          sudo pip3 install --upgrade "setuptools>=70,<81" wheel "setuptools_scm<8"\n'
+    if install_line in text:
+        return text
+    marker = "          # set-up appimage-builder\n"
+    if marker not in text:
+        return text
+    return text.replace(marker, install_line + marker, 1)
+
+
+def patch_flutter_build_workflow(source_dir: Path) -> bool:
+    path = source_dir / ".github" / "workflows" / "flutter-build.yml"
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    original = text
+    text = _ensure_workflow_permissions(text)
+    if "build_windows_x64:" not in text:
+        text = text.replace(
+            '        default: "nightly"\n',
+            '        default: "nightly"\n'
+            f"{_workflow_call_inputs_block()}\n",
+            1,
+        )
+    job_conditions = {
+        "build-RustDeskTempTopMostWindow": "inputs.build_windows_x64",
+        "build-for-windows-flutter": "inputs.build_windows_x64",
+        "build-for-windows-sciter": "inputs.build_windows_x86",
+        "build-rustdesk-ios": "inputs.upload-artifact && inputs.build_ios",
+        "build-for-macOS": "inputs.build_macos",
+        "publish_unsigned": "inputs.upload-artifact && inputs.build_windows_x64 && inputs.build_windows_x86 && inputs.build_macos",
+        "build-rustdesk-android": "inputs.build_android",
+        "build-rustdesk-android-universal": "inputs.upload-artifact && inputs.build_android",
+        "build-rustdesk-linux": "inputs.build_linux",
+        "build-rustdesk-linux-sciter": "inputs.upload-artifact && inputs.build_linux_sciter",
+        "build-appimage": "inputs.upload-artifact && inputs.build_appimage && inputs.build_linux",
+        "build-flatpak": "inputs.upload-artifact && inputs.build_flatpak && inputs.build_linux && inputs.build_linux_sciter",
+    }
+    for job, expression in job_conditions.items():
+        text = _set_job_if(text, job, expression)
+    text = _patch_appimage_python_build_tools(text)
+    if text != original:
+        _write_text(path, text)
+        return True
+    return False
+
+
+def patch_build_target_workflows(source_dir: Path, payload: dict[str, Any], progress: Callable[[str], None]) -> None:
+    selected_targets = payload.get("build_targets") or list(RUSTDESK_DEFAULT_BUILD_TARGETS)
+    release_tag = sanitize_release_tag(str(payload.get("release_tag") or default_release_tag(payload)))
+    payload["release_tag"] = release_tag
+    changed = 0
+    if patch_flutter_tag_workflow(source_dir, selected_targets, release_tag):
+        changed += 1
+    if patch_flutter_build_workflow(source_dir):
+        changed += 1
+    labels = "、".join(build_target_labels(selected_targets))
+    progress(f"已写入 Actions 编译选择：{labels}；Release：{release_tag}（修改 workflow {changed} 个）")
+
+
+def _decode_icon_upload(payload: dict[str, Any]) -> bytes | None:
+    value = str(payload.get("icon_data_url") or "").strip()
+    if not value:
+        return None
+    header, separator, data = value.partition(",")
+    if not separator or ";base64" not in header or "image/png" not in header:
+        raise RustDeskCustomizeError("Logo 上传目前请使用 PNG 图片")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RustDeskCustomizeError("Logo 图片数据无法解析，请重新上传 PNG") from exc
+    if not raw or len(raw) > MAX_ICON_UPLOAD_BYTES:
+        raise RustDeskCustomizeError("Logo 图片大小需在 5MB 以内")
+    return raw
+
+
+def _square_icon(image: Any, size: int) -> Any:
+    from PIL import Image
+
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    work = image.copy()
+    work.thumbnail((size, size), Image.Resampling.LANCZOS)
+    left = (size - work.width) // 2
+    top = (size - work.height) // 2
+    canvas.alpha_composite(work, (left, top))
+    return canvas
+
+
+def _save_icon_png(image: Any, path: Path, size: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _square_icon(image, size).save(path, format="PNG")
+
+
+def _save_embedded_svg(png_bytes: bytes, path: Path) -> None:
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    _write_text(
+        path,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1024\" height=\"1024\" viewBox=\"0 0 1024 1024\">"
+        f"<image width=\"1024\" height=\"1024\" href=\"data:image/png;base64,{encoded}\"/>"
+        "</svg>\n",
+    )
+
+
+def apply_custom_icon(source_dir: Path, payload: dict[str, Any], progress: Callable[[str], None]) -> None:
+    raw = _decode_icon_upload(payload)
+    if not raw:
+        return
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RustDeskCustomizeError("服务器缺少 Pillow，无法处理 Logo 图片，请先更新依赖") from exc
+    try:
+        image = Image.open(io.BytesIO(raw)).convert("RGBA")
+    except Exception as exc:
+        raise RustDeskCustomizeError("Logo 图片不是有效 PNG，请重新上传") from exc
+    if min(image.size) < 64:
+        raise RustDeskCustomizeError("Logo 图片尺寸太小，建议上传 1024x1024 PNG")
+
+    png_1024 = io.BytesIO()
+    _square_icon(image, 1024).save(png_1024, format="PNG")
+    png_1024_bytes = png_1024.getvalue()
+    _write_text(source_dir / "CUSTOM_CLIENT_ICON.txt", f"Logo 文件：{payload.get('icon_file_name') or 'uploaded.png'}\n")
+
+    for name, size in {
+        "32x32.png": 32,
+        "64x64.png": 64,
+        "128x128.png": 128,
+        "128x128@2x.png": 256,
+        "icon.png": 256,
+        "mac-icon.png": 512,
+    }.items():
+        _save_icon_png(image, source_dir / "res" / name, size)
+    for name in ["scalable.svg", "logo.svg"]:
+        path = source_dir / "res" / name
+        if path.exists():
+            _save_embedded_svg(png_1024_bytes, path)
+
+    ico_image = _square_icon(image, 256)
+    ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+    for rel in [
+        ("res", "icon.ico"),
+        ("res", "tray-icon.ico"),
+        ("flutter", "windows", "runner", "resources", "app_icon.ico"),
+    ]:
+        path = source_dir.joinpath(*rel)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ico_image.save(path, format="ICO", sizes=ico_sizes)
+
+    android_sizes = {
+        "mipmap-mdpi": 48,
+        "mipmap-hdpi": 72,
+        "mipmap-xhdpi": 96,
+        "mipmap-xxhdpi": 144,
+        "mipmap-xxxhdpi": 192,
+    }
+    android_root = source_dir / "flutter" / "android" / "app" / "src" / "main" / "res"
+    for folder, size in android_sizes.items():
+        for name in ["ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png", "ic_stat_logo.png"]:
+            _save_icon_png(image, android_root / folder / name, size)
+
+    for rel in [
+        ("flutter", "ios", "Runner", "Assets.xcassets", "AppIcon.appiconset"),
+        ("flutter", "macos", "Runner", "Assets.xcassets", "AppIcon.appiconset"),
+    ]:
+        icon_dir = source_dir.joinpath(*rel)
+        if not icon_dir.exists():
+            continue
+        for path in icon_dir.glob("*.png"):
+            try:
+                with Image.open(path) as existing:
+                    size = max(existing.size)
+            except Exception:
+                size = 1024
+            _save_icon_png(image, path, size)
+
+    mac_icns = source_dir / "flutter" / "macos" / "Runner" / "AppIcon.icns"
+    if mac_icns.parent.exists():
+        try:
+            _square_icon(image, 1024).save(mac_icns, format="ICNS")
+        except Exception:
+            pass
+    progress("已生成客户端 Logo/图标资源")
+
+
 def write_custom_notes(source_dir: Path, payload: dict[str, Any]) -> None:
     values = {
         "rustdesk_version": payload["rustdesk_version"],
@@ -414,6 +876,9 @@ def write_custom_notes(source_dir: Path, payload: dict[str, Any]) -> None:
         "default_password": "已设置" if payload.get("default_password") else "未设置",
         "allow_remote_config_modification": bool(payload.get("allow_remote_config_modification", True)),
         "hide_cm": bool(payload.get("hide_cm", True)),
+        "build_targets": "、".join(build_target_labels(payload.get("build_targets") or list(RUSTDESK_DEFAULT_BUILD_TARGETS))),
+        "release_tag": payload.get("release_tag") or default_release_tag(payload),
+        "icon_file": payload.get("icon_file_name") or "未上传",
     }
     _write_text(
         source_dir / "CUSTOM_CLIENT.md",
@@ -427,10 +892,13 @@ def write_custom_notes(source_dir: Path, payload: dict[str, Any]) -> None:
 
 def apply_customizations(source_dir: Path, payload: dict[str, Any], progress: Callable[[str], None]) -> None:
     remove_bundled_server_settings(source_dir, progress)
+    patch_build_target_workflows(source_dir, payload, progress)
+    patch_deprecated_workflow_actions(source_dir, progress)
     patch_config_rs(source_dir, payload, progress)
     patch_common_rs(source_dir, payload, progress)
     patch_ui_hide_links(source_dir, payload, progress)
     patch_about_pages(source_dir, payload, progress)
+    apply_custom_icon(source_dir, payload, progress)
     write_custom_notes(source_dir, payload)
 
 
@@ -463,7 +931,7 @@ def commit_and_push_target(
 ) -> dict[str, Any]:
     env = git_noninteractive_env()
     redactions = token_redactions(token)
-    branch = payload.get("target_branch") or repo.default_branch or "main"
+    branch = repo.default_branch or "main"
     run_command(["git", "checkout", "-B", branch], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=60)
     # RustDesk tracks several source assets that also match its own .gitignore
     # patterns, such as PNG/SVG icons required by Android, macOS, and portable builds.
@@ -498,7 +966,7 @@ def commit_and_push_target(
         redact=redactions,
         timeout=60,
     )
-    run_command(["git", "push", "origin", branch], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=600)
+    run_command(["git", "push", "origin", f"HEAD:refs/heads/{branch}"], cwd=target_dir, env=env, progress=progress, redact=redactions, timeout=600)
     return {"pushed": True, "branch": branch, "url": repo.html_url}
 
 
@@ -507,6 +975,7 @@ def customize_rustdesk(payload: dict[str, Any], progress: Callable[[str], None])
     payload = dict(payload)
     payload["id_server"] = (payload.get("id_server") or "").strip()
     payload["rs_pub_key"] = (payload.get("rs_pub_key") or "").strip()
+    payload["build_targets"] = normalize_build_targets(payload)
     required = {
         "GitHub 公开仓库": payload.get("repo"),
         "RustDesk 官方版本": payload.get("rustdesk_version"),
@@ -545,6 +1014,7 @@ def customize_rustdesk(payload: dict[str, Any], progress: Callable[[str], None])
                 RUSTDESK_REPO_URL,
                 str(source_dir),
             ],
+            env=env,
             progress=progress,
             timeout=1800,
         )

@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>天翼云多账号管理</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260619-0300">
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css?v=5.5.0">
+  <link rel="stylesheet" href="/static/styles.css?v=20260628-0003">
 </head>
 <body>
   <div id="loginView" class="login-shell">
@@ -40,6 +41,10 @@
           <button data-view="ikuai">网关后台</button>
         </details>
         <details class="nav-group" open>
+          <summary>服务器</summary>
+          <button data-view="linux">SSH 管理</button>
+        </details>
+        <details class="nav-group" open>
           <summary>应用工具</summary>
           <button data-view="rustdesk">RustDesk 定制</button>
         </details>
@@ -52,10 +57,10 @@
       <header>
       <div><h2 id="pageTitle">概览</h2><p id="pageSubtitle">查看全部账号和资源状态</p></div>
       <div class="header-actions">
-          <span id="modeBadge" class="mode-badge">模式</span>
           <span id="refreshBadge" class="mode-badge refresh-badge">未刷新</span>
           <select id="accountFilter"><option value="">全部账号</option></select>
-          <button id="consoleBtn">官方控制台</button>
+          <button id="officialConsoleBtn">官方控制台</button>
+          <button id="currentSyncBtn">同步当前页</button>
           <button id="syncBtn">同步资源</button>
           <button id="addAccountBtn" class="primary">添加账号</button>
         </div>
@@ -90,6 +95,22 @@
     <div class="dialog-actions"><button data-close>取消</button><button id="confirmActionBtn" class="danger">确认执行</button></div>
   </dialog>
 
+  <dialog id="renewOrderDialog">
+    <div>
+      <div class="dialog-head">
+        <div><h3>续订订单</h3><p id="renewOrderHint">订单已创建，完成支付后续订才会生效</p></div>
+        <button class="icon-btn" data-close>×</button>
+      </div>
+      <div id="renewOrderBody" class="renew-order-body"></div>
+      <div class="dialog-actions">
+        <button id="renewOrderRefreshBtn" type="button">刷新订单状态</button>
+        <button id="renewOrderUnpaidBtn" type="button">待支付订单</button>
+        <button id="renewOrderPayBtn" class="primary" type="button">打开支付页</button>
+        <button type="button" data-close>关闭</button>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="regionsDialog">
     <div>
       <div class="dialog-head"><div><h3>资源池列表</h3><p>复制需要管理的 regionID，填到账号编辑里的资源池ID列表</p></div><button class="icon-btn" data-close>×</button></div>
@@ -122,6 +143,40 @@
     </form>
   </dialog>
 
+  <dialog id="linuxDialog">
+    <form id="linuxForm" method="dialog">
+      <div class="dialog-head"><div><h3 id="linuxDialogTitle">添加 Linux 服务器</h3><p>保存 SSH 地址和登录资料，后续由平台统一连接管理</p></div><button type="button" class="icon-btn" data-close>×</button></div>
+      <input name="id" type="hidden">
+      <div class="form-grid">
+        <label>服务器名称<input name="name" placeholder="例如：香港节点 01" required></label>
+        <label>SSH 地址<input name="host" placeholder="IP 或域名" required></label>
+        <label>端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
+        <label>登录账号<input name="username" autocomplete="off"></label>
+        <label>登录密码<input name="password" type="password" autocomplete="new-password"></label>
+        <label>私钥口令<input name="private_key_passphrase" type="password" autocomplete="new-password" placeholder="私钥无口令可留空"></label>
+        <label class="wide">SSH 私钥<textarea name="private_key" rows="7" spellcheck="false" placeholder="可选，粘贴 -----BEGIN OPENSSH PRIVATE KEY----- ..."></textarea></label>
+        <label class="wide">备注<textarea name="notes" rows="2"></textarea></label>
+      </div>
+      <div id="linuxError" class="form-error"></div>
+      <div class="dialog-actions"><button type="button" data-close>取消</button><button id="saveLinuxBtn" class="primary" type="submit">加密保存服务器</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="linuxFileDialog" class="linux-file-dialog">
+    <div>
+      <div class="dialog-head">
+        <div><h3>文件编辑</h3><p id="linuxFileDialogPath">-</p></div>
+        <button type="button" class="icon-btn" data-close>×</button>
+      </div>
+      <input id="linuxFileEditorPath" type="hidden">
+      <textarea id="linuxFileContent" spellcheck="false"></textarea>
+      <div class="dialog-actions">
+        <button type="button" data-close>取消</button>
+        <button id="linuxSaveFileBtn" type="button" class="primary">保存到服务器</button>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="rechargeDialog" class="browser-dialog">
     <div>
       <div class="dialog-head">
@@ -143,6 +198,8 @@
   </dialog>
 
   <div id="toast"></div>
-  <script src="/static/app.js?v=20260619-0300"></script>
+  <script src="/static/vendor/xterm/xterm.js?v=5.5.0"></script>
+  <script src="/static/vendor/xterm/addon-fit.js?v=0.10.0"></script>
+    <script src="/static/app.js?v=20260708-0002"></script>
 </body>
 </html>

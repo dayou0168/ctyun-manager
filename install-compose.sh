@@ -84,13 +84,33 @@ download_compose_file() {
 
 create_env_file() {
   cd "$INSTALL_DIR"
+  generate_token() {
+    od -An -N36 -tx1 /dev/urandom | tr -d ' \n'
+  }
+
+  set_env_value() {
+    local key="$1" value="$2"
+    if grep -q "^$key=" .env; then
+      sed -i "s|^$key=.*|$key=$value|" .env
+    else
+      printf '%s=%s\n' "$key" "$value" >>.env
+    fi
+  }
+
+  env_value() {
+    local key="$1"
+    grep -E "^$key=" .env 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+  }
+
   if [ ! -f .env ]; then
-    SESSION_SECRET="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    ADMIN_PASSWORD="$(generate_token)"
+    SESSION_SECRET="$(generate_token)"
+    GENERATED_ADMIN_PASSWORD=1
     cat >.env <<EOF
 CTYUN_MANAGER_PORT=$APP_PORT
 CTYUN_MANAGER_IMAGE=$IMAGE_NAME
 CTYUN_MANAGER_ADMIN_USER=admin
-CTYUN_MANAGER_ADMIN_PASSWORD=change-me-now
+CTYUN_MANAGER_ADMIN_PASSWORD=$ADMIN_PASSWORD
 CTYUN_MANAGER_SESSION_SECRET=$SESSION_SECRET
 CTYUN_MANAGER_PUBLIC_URL=http://127.0.0.1:$APP_PORT
 CTYUN_BROWSER_HEADFUL=1
@@ -99,6 +119,18 @@ CTYUN_RECHARGE_FAST_ORDER_ENABLED=1
 CTYUN_RECHARGE_QR_CACHE_ENABLED=1
 EOF
     chmod 600 .env
+  else
+    ADMIN_PASSWORD="$(env_value CTYUN_MANAGER_ADMIN_PASSWORD)"
+    GENERATED_ADMIN_PASSWORD=0
+    if [ -z "$ADMIN_PASSWORD" ] || [ "$ADMIN_PASSWORD" = "change-me-now" ]; then
+      ADMIN_PASSWORD="$(generate_token)"
+      set_env_value CTYUN_MANAGER_ADMIN_PASSWORD "$ADMIN_PASSWORD"
+      GENERATED_ADMIN_PASSWORD=1
+    fi
+    SESSION_SECRET="$(env_value CTYUN_MANAGER_SESSION_SECRET)"
+    if [ -z "$SESSION_SECRET" ] || [ "$SESSION_SECRET" = "change-this-session-secret" ]; then
+      set_env_value CTYUN_MANAGER_SESSION_SECRET "$(generate_token)"
+    fi
   fi
 }
 
@@ -136,8 +168,12 @@ echo "Installed ctyun-manager with Docker Compose"
 echo "Image: $IMAGE_NAME"
 echo "Compose file: $INSTALL_DIR/docker-compose.deploy.yml"
 echo "URL: http://SERVER_IP:$APP_PORT"
-echo "Initial username: admin"
-echo "Initial password: change-me-now"
+echo "Admin username: admin"
+if [ "${GENERATED_ADMIN_PASSWORD:-0}" = "1" ]; then
+  echo "Generated admin password: $ADMIN_PASSWORD"
+else
+  echo "Admin password: using CTYUN_MANAGER_ADMIN_PASSWORD from $INSTALL_DIR/.env"
+fi
 echo "Change CTYUN_MANAGER_ADMIN_PASSWORD in $INSTALL_DIR/.env, then run:"
 echo "  cd $INSTALL_DIR && docker compose -f docker-compose.deploy.yml up -d"
 echo "Logs:"

@@ -1,20 +1,26 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import struct
 import time
 import zlib
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import pyotp
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ..config import settings
 from ..security import decrypt_text, encrypt_text
@@ -23,12 +29,22 @@ from ..security import decrypt_text, encrypt_text
 RECHARGE_URL = "https://www.ctyun.cn/console/expense/fund/recharge"
 RECHARGE_CREATE_URL = "https://www.ctyun.cn/gw/account/cash/Recharge"
 RECHARGE_FRONT_URL = "https://www.ctyun.cn/virtual/redirect/funddetail"
+CHECKSTAND_PAY_URL = "https://www.ctyun.cn/checkstand/webpay/pcCheckstand"
+CHECKSTAND_GET_PAY_CHANNELS_URL = "https://www.ctyun.cn/checkstand/unifyapi/getPayChannels"
+CHECKSTAND_PRECREATE_URL = "https://www.ctyun.cn/checkstand/unifyapi/upayprecreate"
+CHECKSTAND_QUERY_URL = "https://www.ctyun.cn/checkstand/unifyapi/upayquery"
+CHECKSTAND_RSA_PUBLIC_KEY = (
+    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCnipScOLtgdPUYuhEcQEY7serbe1KCw10GXH3Bt+2SgeQE4KG5M26"
+    "ixYIzT/wpKZFOtESuq6pZXpHN05HUK0FM/wCb28dBVH2aGZ+QSdR/z7aeitHTlR44FfsRSNhJulVbrioYSv55CDtvi7"
+    "SEXRrtNHJU3hEbpgUnbL/cc/3QbwIDAQAB"
+)
 BALANCE_URL = "https://www.ctyun.cn/gw/account/giftcard/QueryBookSumm"
 OWE_URL = "https://www.ctyun.cn/v1/bcc/bill/QueryOwe"
 ACCOUNT_INFO_URL = "https://www.ctyun.cn/v2/bcc/basicData/getCurrentInfo"
 CONSOLE_ORIGIN = "https://console.ctyun.cn"
 CONSOLE_HOME_URL = "https://console.ctyun.cn/"
 CONSOLE_ECS_CREATE_URL = "https://console.ctyun.cn/compute/index/#/ecm/ecmCreate"
+CONSOLE_ECS_LIST_URL = "https://console.ctyun.cn/compute/index/#/ecm/list"
 CONSOLE_NETWORK_URL = "https://console.ctyun.cn/network/index/"
 TRANSIENT_PAGE_ERRORS = (
     "execution context was destroyed",
@@ -63,6 +79,7 @@ def current_totp(secret: str | None) -> str | None:
 class BrowserSession:
     context: Any
     page: Any
+    last_used: float = field(default_factory=time.monotonic)
     last_page_refresh: float = 0
     interactive_until: float = 0
     last_payment: dict[str, Any] | None = None
@@ -72,6 +89,7 @@ class BrowserSession:
 _playwright: Any = None
 _browser: Any = None
 _sessions: dict[int, BrowserSession] = {}
+_cookie_payments: dict[int, dict[str, Any]] = {}
 _browser_lock = asyncio.Lock()
 _account_operation_locks: dict[int, asyncio.Lock] = {}
 _console_stock_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
@@ -79,6 +97,9 @@ _console_shared_stock_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _console_region_stock_locks: dict[str, asyncio.Lock] = {}
 _console_region_platform_cache: dict[tuple[int, str], tuple[float, str]] = {}
 _console_eip_options_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+_CONSOLE_SIGNATURE_KEY = Ed25519PrivateKey.from_private_bytes(
+    bytes.fromhex("4a63004ed2f21efb763166ca9396b57086c4eb999d00f62880bdacd358689380")
+)
 PAYMENT_METHODS = {
     "alipay": "支付宝",
     "bestpay": "翼支付",
@@ -89,6 +110,38 @@ PAYMENT_CHANNEL_CODES = {
     "wechat": "8",
     "bestpay": "9",
 }
+QR_VALID_SECONDS = 60
+PAYMENT_SUCCESS_TRADE_STATUSES = {"SUCCESS", "TRADE_SUCCESS", "PAY_SUCCESS", "PAID", "PAYED", "FINISHED", "COMPLETED"}
+PAYMENT_FAILED_TRADE_STATUSES = {"FAIL", "FAILED", "TRADE_CLOSED", "CLOSED", "CANCEL", "CANCELLED", "PAYERROR"}
+PAYMENT_PENDING_TRADE_STATUSES = {"NOTPAY", "WAIT_BUYER_PAY", "USERPAYING", "PENDING", ""}
+
+
+def _normalize_trade_status(value: Any) -> str:
+    return str(value or "").strip().upper().replace("-", "_")
+
+
+def _payment_qr_remaining_seconds(payment: dict[str, Any]) -> int:
+    try:
+        return max(0, int(float(payment.get("qr_expires_at") or 0) - time.monotonic() + 0.999))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payment_qr_timing_fields(payment: dict[str, Any]) -> dict[str, Any]:
+    remaining = _payment_qr_remaining_seconds(payment)
+    server_time = time.time()
+    try:
+        expires_at_epoch = float(payment.get("qr_expires_at_epoch") or 0)
+    except (TypeError, ValueError):
+        expires_at_epoch = 0
+    if expires_at_epoch <= 0:
+        expires_at_epoch = server_time + remaining
+    return {
+        "qr_remaining_seconds": remaining,
+        "qr_expires_in": remaining,
+        "qr_server_time": server_time,
+        "qr_expires_at_epoch": expires_at_epoch,
+    }
 
 
 def _account_operation_lock(account_id: int) -> asyncio.Lock:
@@ -109,7 +162,7 @@ def _console_region_stock_lock(region_id: str) -> asyncio.Lock:
 
 
 def _viewer_url() -> str:
-    return "/static/vnc.html"
+    return "/static/vnc.html" if settings.browser_vnc_enabled else ""
 
 
 async def _start_browser() -> Any:
@@ -154,11 +207,13 @@ async def _get_session(account: dict[str, Any]) -> BrowserSession:
     account_id = int(account["id"])
     existing = _sessions.get(account_id)
     if existing:
+        existing.last_used = time.monotonic()
         return existing
 
     async with _browser_lock:
         existing = _sessions.get(account_id)
         if existing:
+            existing.last_used = time.monotonic()
             return existing
         browser = await _start_browser()
         state = None
@@ -554,6 +609,65 @@ async def _console_json(
     return data
 
 
+async def _console_page_request_json(
+    session: BrowserSession,
+    path: str,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, Any] | None = None,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    signed: bool = False,
+) -> dict[str, Any]:
+    params = {key: value for key, value in (params or {}).items() if value not in (None, "")}
+    if signed:
+        params = _console_signed_params(params, body)
+    query = urlencode(params)
+    url = f"{CONSOLE_ORIGIN}{path}"
+    if query:
+        url = f"{url}?{query}"
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN",
+        "X-Requested-With": "XMLHttpRequest",
+        **(headers or {}),
+    }
+    if body is not None:
+        request_headers["Content-Type"] = "application/json;charset=UTF-8"
+        request_headers["feserialnum"] = _console_post_serial(body)
+    request_headers = {key: str(value) for key, value in request_headers.items() if value not in (None, "")}
+    result = await session.page.evaluate(
+        """
+        async ({url, method, headers, body}) => {
+          const options = {
+            method,
+            credentials: "include",
+            headers,
+          };
+          if (body !== null && body !== undefined) {
+            options.body = JSON.stringify(body);
+          }
+          const response = await fetch(url, options);
+          const text = await response.text();
+          return {status: response.status, text};
+        }
+        """,
+        {"url": url, "method": method.upper(), "headers": request_headers, "body": body},
+    )
+    status = int(result.get("status", 0))
+    text = str(result.get("text") or "")
+    if status in {401, 403}:
+        raise RuntimeError(f"official_console_unauthorized:{status}:{text[:200]}")
+    try:
+        data = json.loads(text or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"official_console_not_json:{text[:240]}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("official_console_bad_json")
+    data.setdefault("_http_status", status)
+    return data
+
+
 async def _ensure_console_context(account: dict[str, Any], session: BrowserSession) -> tuple[bool, str]:
     page = session.page
     try:
@@ -656,6 +770,102 @@ def _storage_cookie_header(account: dict[str, Any]) -> str:
     return "; ".join(pairs)
 
 
+def _console_signature_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _console_signature_clean(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key in sorted(value):
+            cleaned = _console_signature_clean(value[key])
+            if cleaned is not None:
+                result[str(key)] = cleaned
+        return result
+    if isinstance(value, list):
+        return [item for item in (_console_signature_clean(item) for item in value) if item is not None]
+    return value
+
+
+def _console_signature_array(value: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    for item in value:
+        if isinstance(item, list):
+            result.append(_console_signature_array(item))
+        elif isinstance(item, dict):
+            result.append(_console_signature_items(item))
+        else:
+            result.append(item)
+    return result
+
+
+def _console_signature_text(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _console_signature_items(value: dict[str, Any]) -> list[str]:
+    cleaned = _console_signature_clean(value)
+    if not isinstance(cleaned, dict):
+        return []
+    result: list[str] = []
+    for key in sorted(cleaned):
+        item = cleaned[key]
+        if isinstance(item, list):
+            result.append(f"{key}={_console_signature_json(_console_signature_array(item))}")
+        elif isinstance(item, dict):
+            result.append(f"{key}={_console_signature_json(_console_signature_items(item))}")
+        else:
+            result.append(f"{key}={_console_signature_text(item)}")
+    return result
+
+
+def _console_signed_params(params: dict[str, Any], body: dict[str, Any] | None = None) -> dict[str, Any]:
+    signed = _console_signature_clean(params)
+    signed = signed if isinstance(signed, dict) else {}
+    signed["timestamp"] = signed.get("timestamp") or int(time.time() * 1000)
+    signed["nonce"] = secrets.token_bytes(16).hex()
+    canonical = f"params={_console_signature_json(_console_signature_items(signed))}"
+    if body:
+        canonical += f"&body={_console_signature_json(_console_signature_items(body))}"
+    signature = _CONSOLE_SIGNATURE_KEY.sign(canonical.encode("utf-8")).hex()
+    return {**signed, "signature": signature}
+
+
+def _console_post_serial(body: dict[str, Any]) -> str:
+    stamped = {**body, "timestamp": int(time.time() * 1000)}
+    canonical = _console_signature_json(_console_signature_items(stamped))
+    return _CONSOLE_SIGNATURE_KEY.sign(canonical.encode("utf-8")).hex()
+
+
+def _find_console_value(data: Any, keys: set[str]) -> str:
+    stack = [data]
+    seen = 0
+    while stack and seen < 1000:
+        seen += 1
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if str(key) in keys and value:
+                    return str(value)
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(item for item in current if isinstance(item, (dict, list)))
+    return ""
+
+
+def _console_response_message(data: dict[str, Any]) -> str:
+    for key in ("msg", "message", "description", "error_msg", "detail"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def _console_json_cookie_sync(
     account: dict[str, Any],
     path: str,
@@ -664,6 +874,7 @@ def _console_json_cookie_sync(
     *,
     referer: str = CONSOLE_ECS_CREATE_URL,
     region_type: str = "",
+    signed: bool = False,
     timeout: int = 12,
 ) -> dict[str, Any]:
     cookie_header = _storage_cookie_header(account)
@@ -676,6 +887,8 @@ def _console_json_cookie_sync(
     params.setdefault("timestamp", int(time.time() * 1000))
     if region_type:
         params.setdefault("type", region_type)
+    if signed:
+        params = _console_signed_params(params)
     query = urlencode(params)
     url = f"{CONSOLE_ORIGIN}{path}"
     if query:
@@ -715,6 +928,145 @@ def _console_json_cookie_sync(
     return data
 
 
+def _official_json_cookie_sync(
+    account: dict[str, Any],
+    url: str,
+    *,
+    referer: str = RECHARGE_URL,
+    timeout: int = 12,
+) -> dict[str, Any]:
+    cookie_header = _storage_cookie_header(account)
+    if not cookie_header:
+        raise RuntimeError("official_cookie_missing")
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN",
+        "Cache-Control": "no-cache",
+        "Cookie": cookie_header,
+        "Origin": "https://www.ctyun.cn",
+        "Pragma": "no-cache",
+        "Referer": referer,
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-CSRFToken": _storage_cookie_value(account, "csrftoken"),
+    }
+    request_headers = {key: str(value) for key, value in request_headers.items() if value not in (None, "")}
+    last_error = ""
+    for method in ("GET", "POST"):
+        data = b"" if method == "POST" else None
+        request = Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", 200))
+                text = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError(f"official_cookie_unauthorized:{exc.code}") from exc
+            last_error = exc.read().decode("utf-8", errors="replace")[:200]
+            continue
+        except URLError as exc:
+            last_error = str(exc)
+            continue
+        if status in {401, 403}:
+            raise RuntimeError(f"official_cookie_unauthorized:{status}")
+        try:
+            parsed = json.loads(text or "{}")
+        except json.JSONDecodeError:
+            last_error = text[:200]
+            continue
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    raise RuntimeError(f"official_cookie_no_json:{last_error}")
+
+
+async def _official_json_cookie(
+    account: dict[str, Any],
+    url: str,
+    *,
+    referer: str = RECHARGE_URL,
+    timeout: int = 12,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _official_json_cookie_sync,
+        account,
+        url,
+        referer=referer,
+        timeout=timeout,
+    )
+
+
+def _official_json_cookie_request_sync(
+    account: dict[str, Any],
+    url: str,
+    *,
+    method: str = "GET",
+    json_body: dict[str, Any] | None = None,
+    referer: str = RECHARGE_URL,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    cookie_header = _storage_cookie_header(account)
+    if not cookie_header:
+        raise RuntimeError("official_cookie_missing")
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN",
+        "Cache-Control": "no-cache",
+        "Cookie": cookie_header,
+        "Origin": "https://www.ctyun.cn",
+        "Pragma": "no-cache",
+        "Referer": referer,
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-CSRFToken": _storage_cookie_value(account, "csrftoken"),
+    }
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        request_headers["Content-Type"] = "application/json;charset=UTF-8"
+    request_headers = {key: str(value) for key, value in request_headers.items() if value not in (None, "")}
+    request = Request(url, data=data, headers=request_headers, method=method.upper())
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 200))
+            text = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise RuntimeError(f"official_cookie_unauthorized:{exc.code}") from exc
+        body = exc.read().decode("utf-8", errors="replace")[:240]
+        raise RuntimeError(f"official_cookie_http_{exc.code}:{body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"official_cookie_network_error:{exc}") from exc
+    if status in {401, 403}:
+        raise RuntimeError(f"official_cookie_unauthorized:{status}")
+    try:
+        parsed = json.loads(text or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"official_cookie_not_json:{text[:240]}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("official_cookie_bad_json")
+    return parsed
+
+
+async def _official_json_cookie_request(
+    account: dict[str, Any],
+    url: str,
+    *,
+    method: str = "GET",
+    json_body: dict[str, Any] | None = None,
+    referer: str = RECHARGE_URL,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _official_json_cookie_request_sync,
+        account,
+        url,
+        method=method,
+        json_body=json_body,
+        referer=referer,
+        timeout=timeout,
+    )
+
+
 async def _console_json_cookie(
     account: dict[str, Any],
     path: str,
@@ -723,6 +1075,7 @@ async def _console_json_cookie(
     *,
     referer: str = CONSOLE_ECS_CREATE_URL,
     region_type: str = "",
+    signed: bool = False,
     timeout: int = 12,
 ) -> dict[str, Any]:
     return await asyncio.to_thread(
@@ -733,8 +1086,81 @@ async def _console_json_cookie(
         headers,
         referer=referer,
         region_type=region_type,
+        signed=signed,
         timeout=timeout,
     )
+
+
+async def get_console_ecs_vnc_url(account: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    account_id = int(account["id"])
+    cached = payload.get("_cached") if isinstance(payload.get("_cached"), dict) else {}
+    region_id = str(
+        payload.get("regionID")
+        or payload.get("regionId")
+        or payload.get("region_id")
+        or cached.get("regionID")
+        or cached.get("regionId")
+        or cached.get("region_id")
+        or ""
+    )
+    instance_id = str(
+        payload.get("instanceID")
+        or payload.get("instanceId")
+        or payload.get("instance_id")
+        or cached.get("instanceID")
+        or cached.get("instanceId")
+        or cached.get("instance_id")
+        or payload.get("resource_id")
+        or ""
+    )
+    project_id = str(
+        payload.get("projectID")
+        or payload.get("projectId")
+        or payload.get("project_id")
+        or cached.get("projectID")
+        or cached.get("projectId")
+        or cached.get("project_id")
+        or "0"
+    )
+    if not region_id:
+        raise RuntimeError("缺少云主机所属资源池，无法获取官方远程登录地址")
+    if not instance_id:
+        raise RuntimeError("缺少云主机 instance_uuid，无法获取官方远程登录地址")
+    ctyunid = await _console_region_platform_id_from_cookie(account, account_id, region_id)
+    if not ctyunid:
+        raise RuntimeError("保存的 cookie 中没有当前资源池授权信息，请先打开官方控制台刷新登录态")
+    headers = {
+        "regionid": region_id,
+        "regionId": region_id,
+        "platformId": ctyunid,
+        "regionCtyunId": ctyunid,
+    }
+    data = await _console_json_cookie(
+        account,
+        "/console/compute/ecm/ecs/vncconsoles/",
+        {
+            "regionid": region_id,
+            "project_id": project_id,
+            "instance_uuid": instance_id,
+        },
+        headers,
+        referer=CONSOLE_ECS_LIST_URL,
+        signed=True,
+        timeout=20,
+    )
+    url = _find_console_value(data, {"vnc_url", "vncUrl", "vncURL", "url", "login_url", "loginUrl"})
+    if not url:
+        message = _console_response_message(data) or "官方接口没有返回远程登录地址"
+        raise RuntimeError(message)
+    return {
+        "status": "ready",
+        "message": "已通过天翼云官方控制台接口获取远程登录地址。",
+        "url": url,
+        "viewer_url": url,
+        "source": "console_cookie",
+        "regionID": region_id,
+        "instanceID": instance_id,
+    }
 
 
 async def _console_region_platform_id_from_cookie(account: dict[str, Any], account_id: int, region_id: str) -> str:
@@ -836,6 +1262,18 @@ async def _console_region_platform_id(session: BrowserSession, account_id: int, 
         found = _find_region_platform_id(data, region_id)
         if found:
             return remember(found)
+    if str(session.page.url).startswith(CONSOLE_ORIGIN):
+        for path in (
+            "/console/common/index/platform/list/create/",
+            "/console/common/index/platform/list/",
+        ):
+            try:
+                data = await _console_json(session, path, {"regionid": "all"}, {}, via_page=True)
+            except Exception:
+                continue
+            found = _find_region_platform_id(data, region_id)
+            if found:
+                return remember(found)
     return ""
 
 
@@ -858,6 +1296,256 @@ async def _set_console_region(session: BrowserSession, region_id: str, platform_
                 """,
                 {"regionid": region_id, "ctyunid": platform_id},
             )
+
+
+async def _console_region_identity(session: BrowserSession, region_id: str, *, target_url: str = CONSOLE_ECS_CREATE_URL) -> tuple[str, str]:
+    page = session.page
+    if not str(page.url).startswith(CONSOLE_ORIGIN) or _is_login_url(page.url):
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        await _wait_for_page_ready(page, timeout=20000)
+        session.last_page_refresh = time.monotonic()
+    with suppress(Exception):
+        await session.context.add_cookies([
+            {"name": "regionid", "value": region_id, "url": CONSOLE_ORIGIN},
+        ])
+    deadline = time.monotonic() + 18
+    last_ctyunid = ""
+    last_region_type = ""
+    while time.monotonic() < deadline:
+        try:
+            values = await page.evaluate(
+                """
+                ({regionid}) => {
+                  if (regionid) {
+                    window.sessionStorage.setItem("regionid", regionid);
+                  }
+                  return {
+                    ctyunid: window.sessionStorage.getItem("ctyunid") || "",
+                    regionType: window.sessionStorage.getItem("regionType") || "",
+                    text: (document.body && document.body.innerText || "").slice(0, 120),
+                  };
+                }
+                """,
+                {"regionid": region_id},
+            )
+            last_ctyunid = str(values.get("ctyunid") or "")
+            last_region_type = str(values.get("regionType") or "")
+            if last_ctyunid or last_region_type:
+                break
+        except Exception as exc:
+            if not _is_transient_page_error(exc):
+                raise
+        await page.wait_for_timeout(500)
+    ctyunid = last_ctyunid or region_id
+    region_type = last_region_type or "os"
+    # The compute console stores the real request ctyunid in sessionStorage. For
+    # this generation of API it is the resource-pool id; the older platform id
+    # from platform/list can make network POST calls return 401.
+    with suppress(Exception):
+        await page.evaluate(
+            """
+            ({regionid, ctyunid, regionType}) => {
+              window.sessionStorage.setItem("regionid", regionid || "");
+              window.sessionStorage.setItem("ctyunid", ctyunid || regionid || "");
+              window.sessionStorage.setItem("regionType", regionType || "os");
+            }
+            """,
+            {"regionid": region_id, "ctyunid": ctyunid, "regionType": region_type},
+        )
+    return ctyunid, region_type
+
+
+def _console_deep_items(data: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    stack = [data]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if current.get("id") or current.get("device_id") or current.get("fixed_ips"):
+                result.append(current)
+            stack.extend(value for value in current.values() if isinstance(value, (dict, list)))
+        elif isinstance(current, list):
+            stack.extend(item for item in current if isinstance(item, (dict, list)))
+    return result
+
+
+def _console_port_ips(port: dict[str, Any]) -> list[str]:
+    ips: list[str] = []
+    for fixed in port.get("fixed_ips") or []:
+        if isinstance(fixed, dict):
+            value = str(fixed.get("ip_address") or fixed.get("ipAddress") or "").strip()
+            if value and value not in ips:
+                ips.append(value)
+    for value in port.get("secondary_private_ips") or []:
+        text = str(value or "").strip()
+        if text and text not in ips:
+            ips.append(text)
+    return ips
+
+
+def _console_find_port(data: dict[str, Any], nic_id: str, instance_id: str = "", current_ip: str = "") -> dict[str, Any] | None:
+    fallback: dict[str, Any] | None = None
+    for item in _console_deep_items(data):
+        item_id = str(item.get("id") or item.get("port_id") or item.get("portId") or "").strip()
+        if nic_id and item_id == nic_id:
+            return item
+        device_id = str(item.get("device_id") or item.get("deviceID") or item.get("instance_uuid") or "").strip()
+        if instance_id and device_id == instance_id:
+            ips = _console_port_ips(item)
+            if current_ip and current_ip in ips:
+                return item
+            if fallback is None:
+                fallback = item
+    return fallback
+
+
+async def change_console_ecs_private_ip(account: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    account_id = int(account["id"])
+    cached = payload.get("_cached") if isinstance(payload.get("_cached"), dict) else {}
+    region_id = str(
+        payload.get("regionID")
+        or payload.get("regionId")
+        or payload.get("region")
+        or cached.get("regionID")
+        or cached.get("regionId")
+        or cached.get("region")
+        or ""
+    ).strip()
+    instance_id = str(
+        payload.get("instanceID")
+        or payload.get("instanceId")
+        or payload.get("resource_id")
+        or cached.get("instanceID")
+        or cached.get("instanceId")
+        or cached.get("instance_id")
+        or ""
+    ).strip()
+    target_ip = str(payload.get("privateIP") or payload.get("privateIp") or payload.get("ipAddress") or "").strip()
+    subnet_id = str(payload.get("subnetID") or payload.get("subnetId") or cached.get("subnetID") or cached.get("subnetId") or "").strip()
+    vpc_id = str(payload.get("vpcID") or payload.get("vpcId") or cached.get("vpcID") or cached.get("vpcId") or cached.get("vpc_id") or "").strip()
+    nic_id = str(
+        payload.get("networkInterfaceID")
+        or payload.get("networkCardID")
+        or payload.get("portID")
+        or payload.get("networkInterfaceId")
+        or payload.get("networkCardId")
+        or payload.get("portId")
+        or ""
+    ).strip()
+    current_ip = str(cached.get("private_ip") or cached.get("privateIP") or cached.get("privateIp") or "").strip()
+    network_cards = cached.get("networkCardList") if isinstance(cached.get("networkCardList"), list) else []
+    if network_cards and isinstance(network_cards[0], dict):
+        first_card = network_cards[0]
+        nic_id = nic_id or str(first_card.get("networkCardID") or first_card.get("networkInterfaceID") or first_card.get("id") or "").strip()
+        subnet_id = subnet_id or str(first_card.get("subnetID") or first_card.get("subnetId") or "").strip()
+        current_ip = current_ip or str(first_card.get("IPv4Address") or first_card.get("privateIP") or "").strip()
+    if not region_id:
+        raise RuntimeError("缺少云主机所属资源池，无法修改内网 IP")
+    if not instance_id:
+        raise RuntimeError("缺少云主机 instanceID，无法修改内网 IP")
+    if not target_ip:
+        raise RuntimeError("缺少目标内网 IP")
+    if not subnet_id:
+        raise RuntimeError("缺少目标子网 ID")
+
+    async with _account_operation_lock(account_id):
+        session_result = await ensure_ctyun_session(account)
+        if session_result.get("status") != "ready":
+            raise RuntimeError(session_result.get("message") or "网页登录态不可用，无法调用官方控制台修改内网 IP")
+        session = _sessions[account_id]
+        ready, message = await _ensure_console_context(account, session)
+        if not ready:
+            raise RuntimeError(message)
+        ctyunid, region_type = await _console_region_identity(session, region_id)
+        csrf = await _context_cookie_value(session, "csrftoken")
+        headers = {
+            "X-CSRFToken": csrf,
+            "regionCtyunId": ctyunid,
+            "regionid": region_id,
+            "regionId": region_id,
+            "platformId": ctyunid,
+        }
+        list_params = {"regionid": region_id, "limit": 100, "page": 1, "type": region_type, "ctyunid": ctyunid}
+        ports = await _console_page_request_json(
+            session,
+            "/console/network/api/ports/list/",
+            list_params,
+            headers,
+        )
+        port = _console_find_port(ports, nic_id, instance_id, current_ip)
+        if not port:
+            raise RuntimeError("官方控制台未返回该云主机主网卡，无法修改内网 IP")
+        nic_id = str(port.get("id") or nic_id).strip()
+        vpc_id = str(port.get("network_id") or port.get("networkID") or vpc_id).strip()
+        project_id = str(port.get("project_id") or payload.get("projectID") or cached.get("projectID") or "0").strip()
+        if not nic_id or not vpc_id:
+            raise RuntimeError("官方控制台网卡数据缺少 port_uuid 或 vpc_uuid，无法修改内网 IP")
+
+        body = {
+            "id": instance_id,
+            "instance_uuid": instance_id,
+            "instance_id": instance_id,
+            "vpc_uuid": vpc_id,
+            "sub_uuid": subnet_id,
+            "subnet_uuid": subnet_id,
+            "port_uuid": nic_id,
+            "port_id": nic_id,
+            "networkInterfaceID": nic_id,
+            "private_ip": target_ip,
+            "ip_address": target_ip,
+            "fixed_ip": target_ip,
+            "project_id": project_id,
+            "regionid": region_id,
+            "zoneId": payload.get("zoneId") or "default",
+            "action": "update_ins_ip",
+        }
+        response = await _console_page_request_json(
+            session,
+            "/console/compute/api/instances/action/",
+            {"type": region_type, "ctyunid": ctyunid},
+            headers,
+            method="POST",
+            body=body,
+            signed=True,
+        )
+        errstatus = str(response.get("errstatus") if response.get("errstatus") is not None else "")
+        errcode = str(response.get("errcode") or response.get("errorCode") or "").upper()
+        code = str(response.get("code") or response.get("statusCode") or "")
+        if errstatus not in {"", "0"} or (errcode and errcode != "SUCCESS") or code not in {"", "200", "800"}:
+            message = _console_response_message(response) or json.dumps(response, ensure_ascii=False)[:240]
+            raise RuntimeError(f"官方控制台修改内网 IP 失败：{message}")
+        job_id = ""
+        results = response.get("results")
+        if isinstance(results, list) and results and isinstance(results[0], dict):
+            job_id = str(results[0].get("jobid") or results[0].get("jobID") or "")
+
+        latest_port = port
+        for delay in (3, 5, 10, 20, 30):
+            await session.page.wait_for_timeout(delay * 1000)
+            latest = await _console_page_request_json(
+                session,
+                "/console/network/api/ports/list/",
+                list_params,
+                headers,
+            )
+            latest_port = _console_find_port(latest, nic_id, instance_id, "")
+            if latest_port and target_ip in _console_port_ips(latest_port):
+                return {
+                    "statusCode": 800,
+                    "errorCode": "SUCCESS",
+                    "message": "success",
+                    "description": f"官方控制台已确认内网 IP 修改为 {target_ip}",
+                    "source": "console",
+                    "jobid": job_id,
+                    "regionID": region_id,
+                    "instanceID": instance_id,
+                    "networkInterfaceID": nic_id,
+                    "privateIP": target_ip,
+                    "subnetID": subnet_id,
+                    "vpcID": vpc_id,
+                }
+        current_ips = ", ".join(_console_port_ips(latest_port or {})) or "-"
+        raise RuntimeError(f"官方任务已提交但网卡仍显示 {current_ips}，未确认目标 IP {target_ip}；jobid={job_id or '-'}")
 
 
 def _console_items(data: dict[str, Any], preferred_keys: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -1026,6 +1714,17 @@ async def get_console_resource_stock(account: dict[str, Any], region_id: str) ->
             return result
         except Exception as exc:
             cookie_error = str(exc)
+
+        if not settings.console_browser_fallback_enabled:
+            result = {
+                "status": "console_stock_error",
+                "message": f"官方实时库存查询失败：后台 cookie 接口不可用，已关闭控制台后台会话；{cookie_error}",
+                "specs": [],
+                "flavors": [],
+                "storage": [],
+            }
+            _console_stock_cache[cache_key] = (time.monotonic() + 30, result)
+            return result
 
         async with _account_operation_lock(account_id):
             session_result = await ensure_ctyun_session(account)
@@ -1259,7 +1958,9 @@ async def get_console_eip_create_options(account: dict[str, Any], region_id: str
     try:
         try:
             result = await read_with_cookie()
-        except Exception:
+        except Exception as cookie_exc:
+            if not settings.browser_vnc_enabled:
+                raise RuntimeError(f"后台 cookie 接口不可用，已关闭浏览器兜底；{cookie_exc}") from cookie_exc
             result = await read_with_browser()
         _console_eip_options_cache[cache_key] = (time.monotonic() + 600, result)
         return result
@@ -1398,6 +2099,7 @@ async def _complete_login(account: dict[str, Any], session: BrowserSession) -> t
 
 async def ensure_ctyun_session(account: dict[str, Any], open_recharge: bool = False) -> dict[str, Any]:
     session = await _get_session(account)
+    session.last_used = time.monotonic()
     page = session.page
     target = RECHARGE_URL
     try:
@@ -1553,7 +2255,86 @@ async def _read_finance_from_api(session: BrowserSession, session_result: dict[s
     return result
 
 
+async def _read_finance_from_saved_cookie(account: dict[str, Any]) -> dict[str, Any]:
+    balance_data, owe_data, account_data = await asyncio.gather(
+        _official_json_cookie(account, _cache_busted_url(BALANCE_URL)),
+        _official_json_cookie(account, _cache_busted_url(OWE_URL)),
+        _official_json_cookie(account, _cache_busted_url(ACCOUNT_INFO_URL)),
+    )
+    available = _find_first_value(
+        balance_data,
+        ("cashPoints", "availableBalance", "availableAmount", "cashBalance", "availableCash"),
+    )
+    owe = _find_first_value(owe_data, ("realOwe", "oweAmount", "arrears", "outstandingAmount"))
+    provider_account_id = _find_first_value(
+        balance_data,
+        ("accountId", "accountID", "account_id"),
+    ) or _find_first_value(
+        account_data,
+        ("accountId", "accountID", "account_id", "tenantId", "tenantID"),
+    ) or ""
+    available_amount = _to_float(available)
+    if available_amount is None:
+        return {
+            "status": "finance_error",
+            "message": "保存的 cookie 可用，但官方余额接口没有返回可识别余额",
+            "available": None,
+            "owe": _to_float(owe),
+            "provider_account_id": str(provider_account_id),
+        }
+    return {
+        "status": "ready",
+        "message": "余额已通过后台 cookie 接口读取",
+        "available": available_amount,
+        "owe": _to_float(owe),
+        "provider_account_id": str(provider_account_id),
+    }
+
+
+async def keepalive_saved_cookie(account: dict[str, Any]) -> dict[str, Any]:
+    try:
+        account_data = await _official_json_cookie(account, _cache_busted_url(ACCOUNT_INFO_URL))
+        provider_account_id = _find_first_value(
+            account_data,
+            ("accountId", "accountID", "account_id", "tenantId", "tenantID"),
+        ) or ""
+        return {
+            "status": "ready" if provider_account_id or account_data else "unknown",
+            "message": "cookie 保活成功" if provider_account_id or account_data else "cookie 保活返回内容不可识别",
+            "provider_account_id": str(provider_account_id),
+        }
+    except Exception as exc:
+        message = str(exc)
+        status = "login_expired" if "unauthorized" in message or "missing" in message else "failed"
+        return {"status": status, "message": message, "provider_account_id": ""}
+
+
 async def _get_finance_unlocked(account: dict[str, Any], force_api: bool = False) -> dict[str, Any]:
+    cookie_result: dict[str, Any] | None = None
+    cookie_error_message = ""
+    cookie_status = ""
+    try:
+        cookie_result = await _read_finance_from_saved_cookie(account)
+        if cookie_result.get("status") == "ready" and cookie_result.get("available") is not None:
+            return cookie_result
+        cookie_status = str(cookie_result.get("status") or "")
+        if force_api and cookie_status not in {"login_expired", "missing_credentials"}:
+            return {
+                **cookie_result,
+                "message": cookie_result.get("message") or "后台 cookie 未返回可识别余额",
+            }
+        cookie_error_message = cookie_result.get("message", "")
+    except Exception as exc:
+        cookie_error_message = f"后台 cookie 读取余额失败：{exc}"
+        cookie_status = "login_expired" if "unauthorized" in str(exc) or "missing" in str(exc) else "finance_error"
+        if force_api and cookie_status != "login_expired":
+            return {
+                "status": cookie_status,
+                "message": cookie_error_message,
+                "available": None,
+                "owe": None,
+                "provider_account_id": "",
+            }
     session_result = await ensure_ctyun_session(account)
     if session_result["status"] != "ready":
         return {
@@ -1561,6 +2342,7 @@ async def _get_finance_unlocked(account: dict[str, Any], force_api: bool = False
             "available": None,
             "owe": None,
             "provider_account_id": "",
+            "message": session_result.get("message") or cookie_error_message,
         }
 
     session = _sessions[int(account["id"])]
@@ -1608,6 +2390,13 @@ async def get_finance(account: dict[str, Any], force_api: bool = False) -> dict[
 
 
 async def login_and_open_recharge(account: dict[str, Any]) -> dict[str, Any]:
+    if not settings.browser_vnc_enabled:
+        return {
+            "status": "vnc_disabled",
+            "message": "旧版充值页浏览器入口已关闭，请使用“打开充值”创建订单并通过后台 cookie 读取收款码。",
+            "url": "",
+            "viewer_url": "",
+        }
     async with _account_operation_lock(int(account["id"])):
         return await ensure_ctyun_session(account, open_recharge=True)
 
@@ -1713,6 +2502,300 @@ async def _context_page_urls(session: BrowserSession) -> str:
     return " | ".join(urls) or "-"
 
 
+def _friendly_official_cookie_error(exc: Exception) -> str:
+    text = str(exc)
+    if "official_cookie_missing" in text:
+        return "账号没有保存网页登录态，请先打开官方控制台完成一次登录"
+    if "official_cookie_unauthorized" in text:
+        return "官方网页登录态已失效，请重新登录天翼云账号"
+    if "official_cookie_not_json" in text:
+        return "官方接口返回了非 JSON 内容，可能被登录页或风控页拦截"
+    return text
+
+
+def _checkstand_transform_request(params: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in params.items():
+        encoded_key = quote(str(key), safe="")
+        if value is None:
+            parts.append(f"{encoded_key}=null")
+        else:
+            parts.append(f'{encoded_key}="{value}"')
+    return "&".join(parts)
+
+
+def _checkstand_sign(params: dict[str, Any]) -> str:
+    payload = f"&{_checkstand_transform_request(params)}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    pem = f"-----BEGIN PUBLIC KEY-----\n{CHECKSTAND_RSA_PUBLIC_KEY}\n-----END PUBLIC KEY-----\n"
+    public_key = serialization.load_pem_public_key(pem.encode("ascii"))
+    encrypted = public_key.encrypt(digest.encode("utf-8"), rsa_padding.PKCS1v15())
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def _parse_checkstand_query(payment_url: str) -> dict[str, str]:
+    query = parse_qs(urlparse(payment_url).query)
+    result = {key: values[0] for key, values in query.items() if values}
+    if result.get("sign"):
+        result["sign"] = result["sign"].replace(" ", "+")
+    return result
+
+
+def _payment_channel_code(method: str) -> str:
+    return PAYMENT_CHANNEL_CODES.get(str(method or "").lower(), "")
+
+
+def _qr_png_from_text(text: str) -> bytes:
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=3,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def _create_recharge_order_cookie_unlocked(account: dict[str, Any], amount: str) -> dict[str, Any]:
+    account_id = int(account["id"])
+    cents = _amount_to_cents(amount)
+    create_url = (
+        f"{RECHARGE_CREATE_URL}?"
+        f"{urlencode({'amount': cents, 'frontUrl': RECHARGE_FRONT_URL, 'platform': '1'})}"
+    )
+    data = await _official_json_cookie_request(account, create_url, method="GET", referer=RECHARGE_URL, timeout=25)
+    payment_url = _extract_payment_url(data)
+    if not payment_url:
+        message = _find_first_value(data, ("message", "msg", "reason", "errorMsg", "error")) or "官方未返回收银台地址"
+        raise RuntimeError(str(message))
+
+    query = _parse_checkstand_query(payment_url)
+    provider_account_id, order_no = _payment_query_values(payment_url)
+    if not provider_account_id or not order_no:
+        raise RuntimeError("官方收银台地址缺少 account_id 或 out_trade_no")
+
+    channel_body = dict(query)
+    channel_body["unipayUrl"] = CHECKSTAND_PAY_URL
+    channel_data = await _official_json_cookie_request(
+        account,
+        CHECKSTAND_GET_PAY_CHANNELS_URL,
+        method="POST",
+        json_body=channel_body,
+        referer=payment_url,
+        timeout=25,
+    )
+    if channel_data.get("success") is False:
+        raise RuntimeError(str(channel_data.get("errorMsg") or "官方支付渠道查询失败"))
+    channel_result = channel_data.get("result") if isinstance(channel_data.get("result"), dict) else {}
+    platform = channel_result.get("platform") or 1
+
+    _cookie_payments[account_id] = {
+        "account_id": provider_account_id,
+        "provider_account_id": provider_account_id,
+        "out_trade_no": order_no,
+        "order_no": order_no,
+        "amount": amount,
+        "total_amount": query.get("total_amount") or cents,
+        "back_url": query.get("back_url") or "",
+        "body": query.get("body") or "",
+        "front_url": query.get("front_url") or RECHARGE_FRONT_URL,
+        "order_cancel_time": query.get("order_cancel_time") or "",
+        "order_type": query.get("order_type") or "2",
+        "subject": query.get("subject") or "",
+        "platform": platform,
+        "url": payment_url,
+        "created_at": time.monotonic(),
+        "cookie_payment": True,
+    }
+    return {
+        "status": "ready",
+        "message": f"官方后台 cookie 下单成功：¥{amount}",
+        "url": payment_url,
+        "order_no": order_no,
+        "provider_account_id": provider_account_id,
+        "amount": amount,
+        "cookie_payment": True,
+        "fast_path": True,
+    }
+
+
+async def _activate_cookie_payment_unlocked(
+    account: dict[str, Any],
+    payment_method: str,
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    account_id = int(account["id"])
+    method = str(payment_method or "").lower()
+    label = PAYMENT_METHODS.get(method)
+    channel_code = _payment_channel_code(method)
+    if not label or not channel_code:
+        return {"status": "payment_method_error", "message": "不支持的支付方式", "payment_method": method}
+    payment = _cookie_payments.get(account_id)
+    if not payment:
+        return {"status": "payment_session_error", "message": "当前账号没有后台支付订单", "payment_method": method}
+
+    sign_params = {
+        "accountId": payment["provider_account_id"],
+        "backUrl": payment["back_url"],
+        "body": payment["body"],
+        "frontUrl": payment["front_url"],
+        "orderCancelTime": payment["order_cancel_time"],
+        "orderType": payment["order_type"],
+        "outTradeNo": payment["out_trade_no"],
+        "payChannel": channel_code,
+        "platform": payment["platform"],
+        "totalAmount": payment["total_amount"],
+        "subject": payment["subject"],
+    }
+    request_body = dict(sign_params)
+    if refresh:
+        request_body["refreshFlag"] = 1
+    request_body["sign"] = _checkstand_sign(sign_params)
+    data = await _official_json_cookie_request(
+        account,
+        CHECKSTAND_PRECREATE_URL,
+        method="POST",
+        json_body=request_body,
+        referer=str(payment.get("url") or CHECKSTAND_PAY_URL),
+        timeout=25,
+    )
+    if data.get("success") is not True:
+        return {
+            "status": "payment_method_error",
+            "message": str(data.get("errorMsg") or "官方二维码生成失败"),
+            "payment_method": method,
+            "cookie_payment": True,
+        }
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    qr_code = str(result.get("qrCode") or "")
+    if not qr_code:
+        return {
+            "status": "qr_unavailable",
+            "message": "官方接口未返回二维码内容",
+            "payment_method": method,
+            "cookie_payment": True,
+        }
+
+    now = time.monotonic()
+    wall_now = time.time()
+    payment.update({
+        "payment_method": method,
+        "pay_channel": channel_code,
+        "qr_code": qr_code,
+        "trade_no": str(result.get("tradeNo") or ""),
+        "out_trade_no": str(result.get("outTradeNo") or payment.get("out_trade_no") or ""),
+        "order_no": str(result.get("outTradeNo") or payment.get("order_no") or ""),
+        "qr_created_at": now,
+        "qr_expires_at": now + QR_VALID_SECONDS,
+        "qr_expires_at_epoch": wall_now + QR_VALID_SECONDS,
+    })
+    payment.pop("qr_png", None)
+    payment.pop("qr_png_at", None)
+    _cookie_payments[account_id] = payment
+    return {
+        "status": "ready",
+        "message": f"{label}收款信息已通过后台 cookie 加载",
+        "payment_method": method,
+        "qr_available": True,
+        "qr_cached": False,
+        "url": payment.get("url"),
+        "order_no": payment.get("order_no"),
+        "provider_account_id": payment.get("provider_account_id"),
+        "amount": payment.get("amount"),
+        **_payment_qr_timing_fields(payment),
+        "cookie_payment": True,
+    }
+
+
+async def _query_cookie_payment_status_unlocked(account: dict[str, Any]) -> dict[str, Any]:
+    account_id = int(account["id"])
+    payment = _cookie_payments.get(account_id)
+    if not payment:
+        return {"status": "no_payment_page", "message": "当前没有后台支付订单"}
+    payment_snapshot = dict(payment)
+    try:
+        data = await _official_json_cookie_request(
+            account,
+            CHECKSTAND_QUERY_URL,
+            method="POST",
+            json_body={
+                "accountId": payment_snapshot.get("provider_account_id"),
+                "outTradeNo": payment_snapshot.get("out_trade_no"),
+            },
+            referer=str(payment_snapshot.get("url") or CHECKSTAND_PAY_URL),
+            timeout=8,
+        )
+    except Exception as exc:
+        current_payment = _cookie_payments.get(account_id) or payment_snapshot
+        remaining = _payment_qr_remaining_seconds(current_payment)
+        return {
+            "status": "unknown",
+            "message": f"官方支付状态查询暂时无响应，稍后自动重试：{exc}",
+            "trade_status": "",
+            "order_no": current_payment.get("out_trade_no") or payment_snapshot.get("out_trade_no"),
+            **_payment_qr_timing_fields(current_payment),
+            "cookie_payment": True,
+        }
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    trade_status = _normalize_trade_status(result.get("tradeStatus") or data.get("tradeStatus"))
+    current_payment = _cookie_payments.get(account_id) or payment_snapshot
+    remaining = _payment_qr_remaining_seconds(current_payment)
+    if data.get("success") is True and trade_status in PAYMENT_SUCCESS_TRADE_STATUSES:
+        return {
+            "status": "paid",
+            "message": "官方支付状态接口显示支付成功",
+            "trade_status": trade_status,
+            "order_no": payment_snapshot.get("out_trade_no"),
+            **_payment_qr_timing_fields(current_payment),
+            "cookie_payment": True,
+        }
+    if data.get("success") is True and trade_status in PAYMENT_FAILED_TRADE_STATUSES:
+        return {
+            "status": "failed",
+            "message": "官方支付状态接口显示支付失败",
+            "trade_status": trade_status,
+            "order_no": payment_snapshot.get("out_trade_no"),
+            **_payment_qr_timing_fields(current_payment),
+            "cookie_payment": True,
+        }
+    if remaining <= 0 and payment.get("qr_code"):
+        return {
+            "status": "expired",
+            "message": "二维码已过期，请刷新二维码",
+            "trade_status": trade_status or "NOTPAY",
+            "order_no": current_payment.get("out_trade_no") or payment_snapshot.get("out_trade_no"),
+            "qr_remaining_seconds": 0,
+            "qr_expires_in": 0,
+            "qr_server_time": time.time(),
+            "qr_expires_at_epoch": time.time(),
+            "cookie_payment": True,
+        }
+    if data.get("success") is False:
+        return {
+            "status": "unknown",
+            "message": str(data.get("errorMsg") or "官方支付状态接口查询失败"),
+            "trade_status": trade_status,
+            "order_no": current_payment.get("out_trade_no") or payment_snapshot.get("out_trade_no"),
+            **_payment_qr_timing_fields(current_payment),
+            "cookie_payment": True,
+        }
+    return {
+        "status": "pending",
+        "message": "官方支付状态接口显示等待付款",
+        "trade_status": trade_status or "NOTPAY",
+        "order_no": current_payment.get("out_trade_no") or payment_snapshot.get("out_trade_no"),
+        **_payment_qr_timing_fields(current_payment),
+        "cookie_payment": True,
+    }
+
+
 async def _create_recharge_order_fast_unlocked(
     account: dict[str, Any],
     session: BrowserSession,
@@ -1797,6 +2880,7 @@ async def _create_recharge_order_fast_unlocked(
         "order_no": order_no,
         "amount": amount,
         "url": payment_page.url,
+        "created_at": time.monotonic(),
         "fast_path": True,
     }
     return {
@@ -1928,6 +3012,7 @@ async def _create_recharge_order_unlocked(account: dict[str, Any], amount: str) 
             "order_no": order_no,
             "amount": amount,
             "url": page.url,
+            "created_at": time.monotonic(),
         }
         await page.bring_to_front()
         return {
@@ -1954,7 +3039,14 @@ async def _create_recharge_order_unlocked(account: dict[str, Any], amount: str) 
 
 async def create_recharge_order(account: dict[str, Any], amount: str) -> dict[str, Any]:
     async with _account_operation_lock(int(account["id"])):
-        return await _create_recharge_order_unlocked(account, amount)
+        try:
+            return await _create_recharge_order_cookie_unlocked(account, amount)
+        except Exception as exc:
+            return {
+                "status": "recharge_order_failed",
+                "message": f"后台 cookie 创建充值订单失败：{_friendly_official_cookie_error(exc)}",
+                "cookie_payment": True,
+            }
 
 
 async def _find_payment_page_for_session(session: BrowserSession, timeout_ms: int = 4000) -> Any | None:
@@ -1996,6 +3088,9 @@ async def activate_payment_method(account: dict[str, Any], payment_method: str) 
         }
 
     async with _account_operation_lock(int(account["id"])):
+        if int(account["id"]) in _cookie_payments:
+            return await _activate_cookie_payment_unlocked(account, method)
+
         session = _sessions.get(int(account["id"]))
         if not session:
             return {
@@ -2124,6 +3219,20 @@ async def activate_payment_method(account: dict[str, Any], payment_method: str) 
 
 async def get_payment_qr(account: dict[str, Any]) -> dict[str, Any]:
     async with _account_operation_lock(int(account["id"])):
+        payment = _cookie_payments.get(int(account["id"]))
+        if payment:
+            qr_code = str(payment.get("qr_code") or "")
+            if not qr_code:
+                return {"status": "qr_unavailable", "message": "当前支付方式没有生成二维码"}
+            png = payment.get("qr_png")
+            if isinstance(png, bytes) and float(payment.get("qr_expires_at") or 0) > time.monotonic():
+                return {"status": "ready", "message": "收款码已从后台缓存提取", "png": png}
+            png = await asyncio.to_thread(_qr_png_from_text, qr_code)
+            payment["qr_png"] = png
+            payment["qr_png_at"] = time.monotonic()
+            _cookie_payments[int(account["id"])] = payment
+            return {"status": "ready", "message": "收款码已通过后台 cookie 生成", "png": png}
+
         session = _sessions.get(int(account["id"]))
         if not session:
             return {"status": "qr_unavailable", "message": "当前账号没有支付会话"}
@@ -2558,22 +3667,22 @@ async def _query_official_payment_status(
             "raw": response,
         }
     result = data.get("result") if isinstance(data.get("result"), dict) else {}
-    trade_status = str(result.get("tradeStatus") or data.get("tradeStatus") or "").upper()
-    if data.get("success") is True and trade_status == "SUCCESS":
+    trade_status = _normalize_trade_status(result.get("tradeStatus") or data.get("tradeStatus"))
+    if data.get("success") is True and trade_status in PAYMENT_SUCCESS_TRADE_STATUSES:
         return {
             "status": "paid",
             "message": "官方支付状态接口显示支付成功",
             "trade_status": trade_status,
             "order_no": out_trade_no,
         }
-    if data.get("success") is True and trade_status == "NOTPAY":
+    if data.get("success") is True and trade_status in PAYMENT_PENDING_TRADE_STATUSES:
         return {
             "status": "pending",
             "message": "官方支付状态接口显示等待付款",
             "trade_status": trade_status,
             "order_no": out_trade_no,
         }
-    if data.get("success") is True and trade_status == "FAIL":
+    if data.get("success") is True and trade_status in PAYMENT_FAILED_TRADE_STATUSES:
         return {
             "status": "failed",
             "message": "官方支付状态接口显示支付失败",
@@ -2846,6 +3955,55 @@ async def _click_payment_qr_refresh(page: Any, canvas: Any) -> bool:
 
 async def refresh_payment_qr(account: dict[str, Any]) -> dict[str, Any]:
     async with _account_operation_lock(int(account["id"])):
+        payment = _cookie_payments.get(int(account["id"]))
+        if payment:
+            method = str(payment.get("payment_method") or "wechat")
+            previous_qr = str(payment.get("qr_code") or "")
+            previous_trade_no = str(payment.get("trade_no") or "")
+            last_result: dict[str, Any] | None = None
+            refresh_started = time.monotonic()
+            refresh_started_wall = time.time()
+            for attempt in range(2):
+                result = await _activate_cookie_payment_unlocked(account, method, refresh=True)
+                last_result = result
+                if result.get("status") != "ready":
+                    return result
+                refreshed = _cookie_payments.get(int(account["id"])) or {}
+                next_qr = str(refreshed.get("qr_code") or "")
+                next_trade_no = str(refreshed.get("trade_no") or "")
+                if not previous_qr or next_qr != previous_qr or (next_trade_no and next_trade_no != previous_trade_no):
+                    elapsed_ms = round((time.monotonic() - refresh_started) * 1000)
+                    refresh_deadline = refresh_started + QR_VALID_SECONDS
+                    try:
+                        refreshed["qr_expires_at"] = min(float(refreshed.get("qr_expires_at") or refresh_deadline), refresh_deadline)
+                    except (TypeError, ValueError):
+                        refreshed["qr_expires_at"] = refresh_deadline
+                    refresh_deadline_wall = refresh_started_wall + QR_VALID_SECONDS
+                    try:
+                        refreshed["qr_expires_at_epoch"] = min(float(refreshed.get("qr_expires_at_epoch") or refresh_deadline_wall), refresh_deadline_wall)
+                    except (TypeError, ValueError):
+                        refreshed["qr_expires_at_epoch"] = refresh_deadline_wall
+                    _cookie_payments[int(account["id"])] = refreshed
+                    return {
+                        **result,
+                        "message": "官方二维码已通过后台 cookie 刷新",
+                        "cookie_payment": True,
+                        "refresh_attempts": attempt + 1,
+                        "refresh_elapsed_ms": elapsed_ms,
+                        **_payment_qr_timing_fields(refreshed),
+                    }
+                if attempt < 1:
+                    await asyncio.sleep(0.5)
+            return {
+                **(last_result or {}),
+                "status": "qr_unchanged",
+                "message": "官方返回的二维码内容暂未变化，请稍后再点刷新",
+                "cookie_payment": True,
+                "refresh_attempts": 2,
+                "refresh_elapsed_ms": round((time.monotonic() - refresh_started) * 1000),
+                **_payment_qr_timing_fields(_cookie_payments.get(int(account["id"])) or payment),
+            }
+
         session = _sessions.get(int(account["id"]))
         if not session:
             return {"status": "qr_unavailable", "message": "当前账号没有支付会话"}
@@ -2882,6 +4040,9 @@ async def refresh_payment_qr(account: dict[str, Any]) -> dict[str, Any]:
 
 
 async def check_recharge_payment_status(account: dict[str, Any]) -> dict[str, Any]:
+    if int(account["id"]) in _cookie_payments:
+        return await _query_cookie_payment_status_unlocked(account)
+
     async with _account_operation_lock(int(account["id"])):
         session = _sessions.get(int(account["id"]))
         if not session:
@@ -2966,9 +4127,11 @@ async def check_recharge_payment_status(account: dict[str, Any]) -> dict[str, An
 
 async def close_recharge_session(account_id: int) -> dict[str, Any]:
     async with _account_operation_lock(int(account_id)):
+        _cookie_payments.pop(int(account_id), None)
         session = _sessions.get(int(account_id))
         if not session:
             return {"status": "ready", "message": "没有需要关闭的充值会话", "closed": 0}
+        session.last_used = time.monotonic()
 
         closed = 0
         kept_recharge = 0
@@ -3016,6 +4179,51 @@ async def close_recharge_session(account_id: int) -> dict[str, Any]:
             "kept_recharge": kept_recharge,
             "cookie_state_enc": await _save_state(session),
         }
+
+
+async def cleanup_idle_browser_sessions() -> dict[str, Any]:
+    now = time.monotonic()
+    idle_seconds = settings.browser_session_idle_seconds
+    closed: list[int] = []
+    for account_id, session in list(_sessions.items()):
+        lock = _account_operation_lock(account_id)
+        if lock.locked():
+            continue
+        if now < session.interactive_until:
+            continue
+        if session.last_payment and now - float(session.last_payment.get("created_at", 0)) < idle_seconds:
+            continue
+        if now - session.last_used < idle_seconds:
+            continue
+        async with lock:
+            current = _sessions.get(account_id)
+            if current is not session:
+                continue
+            if now < current.interactive_until or now - current.last_used < idle_seconds:
+                continue
+            _sessions.pop(account_id, None)
+            try:
+                await current.context.close()
+            except Exception:
+                pass
+            closed.append(account_id)
+    return {"status": "ready", "closed": len(closed), "account_ids": closed}
+
+
+def browser_session_stats() -> dict[str, Any]:
+    now = time.monotonic()
+    return {
+        "sessions": len(_sessions),
+        "accounts": [
+            {
+                "account_id": account_id,
+                "idle_seconds": round(now - session.last_used, 1),
+                "interactive": now < session.interactive_until,
+                "pages": sum(1 for page in session.context.pages if not page.is_closed()),
+            }
+            for account_id, session in sorted(_sessions.items())
+        ],
+    }
 
 
 async def reset_browser_session(account_id: int) -> None:

@@ -295,7 +295,6 @@ SECTION_CALLS: dict[str, list[tuple[str, str, dict[str, Any]]]] = {
     for group in IKUAI_MENU_GROUPS
     for item in group["items"]
 }
-
 IKUAI_READONLY_SECTIONS = {
     "homepage",
     "monitor_lanip",
@@ -454,15 +453,3 @@ IKUAI_SECTION_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         "disable": {"func_name": "l2tp_server", "call_action": "edit", "fields": AUTH_SERVICE_FIELDS, "required": {"id"}, "inject": {"enabled": "no"}},
     },
 }
-
-
-for section_id, candidates in SECTION_CALLS.items():
-    if candidates and section_id not in IKUAI_SECTION_ACTIONS and section_id not in IKUAI_READONLY_SECTIONS:
-        IKUAI_SECTION_ACTIONS[section_id] = {
-            "update": {
-                "func_name": "__section__",
-                "call_action": "edit",
-                "fields": "*",
-                "required": set(),
-            }
-        }

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "天翼云控制台桥接",
+  "version": "0.1.1",
+  "description": "从天翼云管理平台接收登录态，并在本机 Chrome 打开已登录的天翼云官方控制台。",
+  "permissions": ["cookies", "tabs", "scripting"],
+  "host_permissions": [
+    "https://ctyun.cn/*",
+    "https://*.ctyun.cn/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "天翼云控制台桥接",
+    "default_popup": "popup.html"
+  }
+}

@@ -60,10 +60,39 @@ echo "Installing Playwright Chromium browser..."
 PLAYWRIGHT_BROWSERS_PATH="$BROWSER_DIR" \
   "$VENV_DIR/bin/python" -m playwright install --with-deps chromium
 
+set_env_value() {
+  local key="$1" value="$2" file="$APP_DIR/.env"
+  if grep -q "^$key=" "$file"; then
+    sed -i "s|^$key=.*|$key=$value|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >>"$file"
+  fi
+}
+
+env_value() {
+  local key="$1" file="$APP_DIR/.env"
+  grep -E "^$key=" "$file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+}
+
+generate_token() {
+  python3 -c 'import secrets; print(secrets.token_urlsafe(36))'
+}
+
 if [ ! -f "$APP_DIR/.env" ]; then
   cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-  SESSION_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
-  sed -i "s|^CTYUN_MANAGER_SESSION_SECRET=.*|CTYUN_MANAGER_SESSION_SECRET=$SESSION_SECRET|" "$APP_DIR/.env"
+fi
+
+ADMIN_PASSWORD="$(env_value CTYUN_MANAGER_ADMIN_PASSWORD)"
+GENERATED_ADMIN_PASSWORD=0
+if [ -z "$ADMIN_PASSWORD" ] || [ "$ADMIN_PASSWORD" = "change-me-now" ]; then
+  ADMIN_PASSWORD="$(generate_token)"
+  set_env_value CTYUN_MANAGER_ADMIN_PASSWORD "$ADMIN_PASSWORD"
+  GENERATED_ADMIN_PASSWORD=1
+fi
+
+SESSION_SECRET="$(env_value CTYUN_MANAGER_SESSION_SECRET)"
+if [ -z "$SESSION_SECRET" ] || [ "$SESSION_SECRET" = "change-this-session-secret" ]; then
+  set_env_value CTYUN_MANAGER_SESSION_SECRET "$(generate_token)"
 fi
 
 for script in install.sh install-linux.sh install-docker.sh install-compose.sh start.sh restart.sh stop.sh; do
@@ -108,7 +137,12 @@ BUILD_VERSION="$(grep -Eo 'APP_VERSION = "[^"]+"' "$APP_DIR/app/main.py" | cut -
 echo "Installed ctyun-manager ${BUILD_VERSION:-unknown}"
 systemctl --no-pager --full status "$SERVICE_NAME" || true
 echo "URL: http://SERVER_IP:$APP_PORT"
-echo "Initial username: admin"
-echo "Initial password: change-me-now"
+ADMIN_USER="$(env_value CTYUN_MANAGER_ADMIN_USER)"
+echo "Admin username: ${ADMIN_USER:-admin}"
+if [ "$GENERATED_ADMIN_PASSWORD" = "1" ]; then
+  echo "Generated admin password: $ADMIN_PASSWORD"
+else
+  echo "Admin password: using CTYUN_MANAGER_ADMIN_PASSWORD from $APP_DIR/.env"
+fi
 echo "Change CTYUN_MANAGER_ADMIN_PASSWORD in $APP_DIR/.env, then run ./restart.sh"
 echo "Logs: journalctl -u $SERVICE_NAME -f"

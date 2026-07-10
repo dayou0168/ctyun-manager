@@ -1,6 +1,10 @@
 const params = new URLSearchParams(location.search);
 const accountId = params.get("account_id");
 const paymentMethod = params.get("payment_method") || "wechat";
+const paymentAmount = params.get("amount") || "";
+const initialExpiresIn = Number(params.get("expires_in") || 0);
+const initialExpiresAtEpoch = Number(params.get("expires_at") || 0);
+const initialServerTimeEpoch = Number(params.get("server_time") || 0);
 const paymentMethodNames = {
   wechat: "微信支付",
   alipay: "支付宝支付",
@@ -10,6 +14,7 @@ const image = document.querySelector("#qrImage");
 const statusNode = document.querySelector("#qrStatus");
 const refreshButton = document.querySelector("#refreshQrBtn");
 const closeButton = document.querySelector("#closeQrBtn");
+const amountNode = document.querySelector("#paymentAmount");
 document.querySelector("#paymentMethodTitle").textContent = paymentMethodNames[paymentMethod] || "扫码支付";
 let attempts = 0;
 let countdownTimer = null;
@@ -17,17 +22,91 @@ let statusTimer = null;
 let remainingSeconds = 60;
 let paymentFinished = false;
 let loadingFrameAttempts = 0;
+let qrExpired = false;
+let refreshInFlight = false;
+let statusInFlight = false;
+let pendingRefreshStartedAtMs = 0;
+
+function normalizedRemainingSeconds(value, fallback = 60) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(3600, Math.ceil(numeric)));
+}
+
+let serverExpiresIn = normalizedRemainingSeconds(initialExpiresIn, 60);
+let serverExpiresAtMs = localDeadlineFromServer(initialExpiresAtEpoch, initialServerTimeEpoch) || Date.now() + serverExpiresIn * 1000;
+
+function localDeadlineFromServer(expiresAtEpoch, serverTimeEpoch = 0) {
+  const expiresAt = Number(expiresAtEpoch);
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return 0;
+  const serverTime = Number(serverTimeEpoch);
+  const base = Number.isFinite(serverTime) && serverTime > 0 ? serverTime : Date.now() / 1000;
+  const remaining = Math.max(0, expiresAt - base);
+  return Date.now() + remaining * 1000;
+}
+
+function setServerExpiresIn(value, fallback = 60) {
+  serverExpiresIn = normalizedRemainingSeconds(value, fallback);
+  serverExpiresAtMs = Date.now() + serverExpiresIn * 1000;
+}
+
+function setServerExpiry(value, expiresAtEpoch = 0, serverTimeEpoch = 0, fallback = 60) {
+  const deadline = localDeadlineFromServer(expiresAtEpoch, serverTimeEpoch);
+  if (deadline) {
+    serverExpiresAtMs = deadline;
+    serverExpiresIn = normalizedRemainingSeconds((serverExpiresAtMs - Date.now()) / 1000, fallback);
+    return;
+  }
+  setServerExpiresIn(value, fallback);
+}
+
+function currentServerRemaining() {
+  return normalizedRemainingSeconds((serverExpiresAtMs - Date.now()) / 1000, serverExpiresIn);
+}
+
+function formatPaymentAmount(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  const numeric = Number(normalized);
+  if (!Number.isFinite(numeric)) return normalized;
+  return numeric.toLocaleString("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function renderPaymentAmount() {
+  if (!amountNode) return;
+  const amount = formatPaymentAmount(paymentAmount);
+  if (!amount) {
+    amountNode.hidden = true;
+    return;
+  }
+  const label = document.createElement("small");
+  label.textContent = "付款金额";
+  amountNode.replaceChildren(label, document.createTextNode(` ¥${amount}`));
+  amountNode.hidden = false;
+}
 
 function fallback(message) {
   clearInterval(countdownTimer);
   clearInterval(statusTimer);
+  refreshInFlight = false;
+  statusInFlight = false;
+  pendingRefreshStartedAtMs = 0;
   image.hidden = true;
   statusNode.textContent = message;
-  parent.postMessage({ type: "ctyun-qr-fallback", message }, location.origin);
+  parent.postMessage({ type: "ctyun-qr-error", message }, location.origin);
 }
 
 function notifyPaymentStatus(status, message) {
   parent.postMessage({ type: "ctyun-recharge-status", status, message }, location.origin);
+}
+
+function ensureStatusPolling() {
+  if (statusTimer || paymentFinished) return;
+  statusTimer = setInterval(pollPaymentStatus, 5000);
+  setTimeout(pollPaymentStatus, 4500);
 }
 
 function imageLooksLikeLoadingFrame(img) {
@@ -107,14 +186,20 @@ function loadQr() {
       if (loadingFrameAttempts < 20) {
         setTimeout(loadQr, 1000);
       } else {
-        fallback("官方二维码长时间未生成，已切换到 VNC");
+        fallback("官方二维码长时间未生成，请刷新二维码或重新创建订单");
       }
       return;
     }
     image.hidden = false;
     attempts = 0;
     loadingFrameAttempts = 0;
-    startCountdown();
+    qrExpired = false;
+    image.style.cursor = "default";
+    image.title = "";
+    refreshInFlight = false;
+    startCountdown(currentServerRemaining());
+    pendingRefreshStartedAtMs = 0;
+    ensureStatusPolling();
   };
   image.onerror = () => {
     image.hidden = true;
@@ -123,15 +208,32 @@ function loadQr() {
       setTimeout(loadQr, 800);
       return;
     }
-    fallback("二维码无法直接显示，已切换到 VNC");
+    fallback("二维码无法直接显示，请刷新二维码或重新创建订单");
   };
   image.src = `/api/accounts/${encodeURIComponent(accountId)}/recharge/qr?t=${Date.now()}`;
 }
 
-function startCountdown() {
+function markExpired(message = "二维码已过期，请点击刷新二维码") {
+  clearInterval(countdownTimer);
+  remainingSeconds = 0;
+  qrExpired = true;
+  image.style.cursor = "pointer";
+  image.title = "二维码已过期，点击刷新";
+  statusNode.textContent = message;
+  refreshButton.disabled = false;
+}
+
+function startCountdown(seconds = 60) {
   if (paymentFinished) return;
   clearInterval(countdownTimer);
-  remainingSeconds = 60;
+  remainingSeconds = normalizedRemainingSeconds(seconds, 60);
+  if (remainingSeconds <= 0) {
+    markExpired();
+    return;
+  }
+  qrExpired = false;
+  image.style.cursor = "default";
+  image.title = "";
   refreshButton.disabled = true;
   statusNode.textContent = `请扫码付款，二维码有效期剩余 ${remainingSeconds} 秒`;
   countdownTimer = setInterval(() => {
@@ -144,14 +246,25 @@ function startCountdown() {
       statusNode.textContent = `请扫码付款，二维码有效期剩余 ${remainingSeconds} 秒`;
       return;
     }
-    clearInterval(countdownTimer);
-    statusNode.textContent = "二维码已过期，请点击刷新二维码";
-    refreshButton.disabled = false;
+    markExpired();
   }, 1000);
 }
 
+function syncCountdownFromBackend(value, expiresAtEpoch = 0, serverTimeEpoch = 0) {
+  if (paymentFinished || qrExpired) return;
+  setServerExpiry(value, expiresAtEpoch, serverTimeEpoch, remainingSeconds);
+  const next = currentServerRemaining();
+  if (next <= 0) {
+    markExpired();
+    return;
+  }
+  if (Math.abs(next - remainingSeconds) < 3) return;
+  startCountdown(currentServerRemaining());
+}
+
 async function pollPaymentStatus() {
-  if (!accountId || paymentFinished) return;
+  if (!accountId || paymentFinished || refreshInFlight || qrExpired || statusInFlight) return;
+  statusInFlight = true;
   try {
     const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/recharge/status?t=${Date.now()}`, {
       cache: "no-store",
@@ -169,18 +282,26 @@ async function pollPaymentStatus() {
       notifyPaymentStatus(result.status, statusNode.textContent);
       return;
     }
-    if (result.status === "expired") {
-      clearInterval(countdownTimer);
-      refreshButton.disabled = false;
-      statusNode.textContent = result.message || "二维码已过期，请点击刷新二维码";
-      notifyPaymentStatus(result.status, statusNode.textContent);
+    if (result.qr_remaining_seconds !== undefined || result.qr_expires_in !== undefined) {
+      syncCountdownFromBackend(result.qr_remaining_seconds ?? result.qr_expires_in, result.qr_expires_at_epoch, result.qr_server_time);
     }
-  } catch {}
+    if (result.status === "expired") {
+      markExpired(result.message || "二维码已过期，请点击刷新二维码");
+    }
+  } catch {
+  } finally {
+    statusInFlight = false;
+  }
 }
 
-refreshButton.onclick = async () => {
-  if (paymentFinished) return;
+async function refreshQr() {
+  if (paymentFinished || refreshInFlight || !accountId || !qrExpired) return;
+  refreshInFlight = true;
   refreshButton.disabled = true;
+  qrExpired = false;
+  pendingRefreshStartedAtMs = Date.now();
+  image.style.cursor = "wait";
+  image.title = "";
   statusNode.textContent = "正在刷新官方二维码...";
   try {
     const response = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/recharge/qr/refresh`, {
@@ -193,11 +314,27 @@ refreshButton.onclick = async () => {
     attempts = 0;
     loadingFrameAttempts = 0;
     image.hidden = true;
+    setServerExpiry(result.qr_remaining_seconds ?? result.qr_expires_in, result.qr_expires_at_epoch, result.qr_server_time, 60);
+    if (pendingRefreshStartedAtMs) {
+      serverExpiresAtMs = Math.min(serverExpiresAtMs, pendingRefreshStartedAtMs + 60000);
+    }
     loadQr();
   } catch (error) {
+    refreshInFlight = false;
+    pendingRefreshStartedAtMs = 0;
     statusNode.textContent = error.message || "二维码刷新失败";
+    qrExpired = true;
+    image.style.cursor = "pointer";
+    image.title = "点击重试刷新";
     refreshButton.disabled = false;
   }
+}
+
+refreshButton.onclick = refreshQr;
+
+image.onclick = () => {
+  if (!qrExpired || paymentFinished) return;
+  refreshQr();
 };
 
 closeButton.onclick = () => {
@@ -206,10 +343,10 @@ closeButton.onclick = () => {
   parent.postMessage({ type: "ctyun-close-recharge" }, location.origin);
 };
 
+renderPaymentAmount();
+
 if (accountId) {
   loadQr();
-  pollPaymentStatus();
-  statusTimer = setInterval(pollPaymentStatus, 3500);
 } else {
-  fallback("缺少充值账号信息，已切换到 VNC");
+  fallback("缺少充值账号信息");
 }

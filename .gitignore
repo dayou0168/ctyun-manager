@@ -14,4 +14,8 @@ master.key
 *.log
 work-*.out.log
 work-*.err.log
+work-*.pid
+*.pid
 ctyun-manager.zip
+ctyun-manager-deploy-*.zip
+*.zip

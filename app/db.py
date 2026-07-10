@@ -99,6 +99,36 @@ def migrate() -> None:
               created_at text not null default current_timestamp,
               updated_at text not null default current_timestamp
             );
+
+            create table if not exists linux_servers (
+              id integer primary key autoincrement,
+              name text not null,
+              host text not null,
+              port integer not null default 22,
+              username_enc text,
+              password_enc text,
+              private_key_enc text,
+              private_key_passphrase_enc text,
+              status text not null default 'enabled',
+              last_status text not null default '',
+              last_message text not null default '',
+              fingerprint text not null default '',
+              notes text not null default '',
+              created_at text not null default current_timestamp,
+              updated_at text not null default current_timestamp
+            );
+
+            create table if not exists rustdesk_jobs (
+              id text primary key,
+              status text not null,
+              message text not null default '',
+              payload_json text not null default '{}',
+              logs_json text not null default '[]',
+              result_json text,
+              error text not null default '',
+              created_at text not null,
+              updated_at text not null
+            );
             """
         )
         columns = [row["name"] for row in conn.execute("pragma table_info(ctyun_accounts)").fetchall()]
