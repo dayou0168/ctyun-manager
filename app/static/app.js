@@ -3653,8 +3653,8 @@ function l2tpServerConfigEnvPairs() {
   const enableIpsec = randomPsk || Boolean(psk);
   const values = {
     VPN_L2TP_PORT: l2tpNumberField("#linuxL2tpPort", "1701", 1, 65535),
-    VPN_MTU: l2tpNumberField("#linuxL2tpMtu", "1400", 576, 1500),
-    VPN_MRU: l2tpNumberField("#linuxL2tpMru", "1400", 576, 1500),
+    VPN_MTU: l2tpNumberField("#linuxL2tpMtu", "1280", 576, 1500),
+    VPN_MRU: l2tpNumberField("#linuxL2tpMru", "1280", 576, 1500),
     VPN_ENABLE_IPSEC: enableIpsec ? "1" : "0",
     VPN_RANDOM_PSK: randomPsk ? "1" : "0",
     VPN_IPSEC_PSK: randomPsk ? "" : psk,
@@ -3663,11 +3663,15 @@ function l2tpServerConfigEnvPairs() {
 }
 
 function l2tpInstallShortcutCommand() {
-  const vips = l2tpInstallVipValues();
+  const candidates = l2tpInstallVipValues();
   const env = l2tpServerConfigEnvPairs();
-  if (vips.length) {
-    env.push(`VPN_VIPS=${shellSingleQuote(vips.join(","))}`);
-  }
+  // The platform supplies candidates only. The installer temporarily adds and
+  // source-pings each one, then persists only the addresses that really work.
+  env.push("VPN_PLATFORM_SCAN='1'");
+  env.push(`VPN_VIP_CANDIDATES=${shellSingleQuote(candidates.join(","))}`);
+  env.push("VPN_VIPS=''");
+  // Account configuration may select a scanned VIP, but must never invent one.
+  env.push("VPN_AUTO_CONFIG_FROM_USERS='0'");
   const scriptUrl = `${location.origin}/install-l2tp-server.sh`;
   const envPrefix = env.length ? `env ${env.join(" ")} ` : "";
   return `curl -fsSL ${shellSingleQuote(scriptUrl)} -o /tmp/install-l2tp-server.sh && chmod 700 /tmp/install-l2tp-server.sh && sudo ${envPrefix}bash /tmp/install-l2tp-server.sh`;
@@ -3735,7 +3739,6 @@ function l2tpInstallVipValues() {
   const seen = new Set();
   const rows = state.linuxL2tpVipCandidates || [];
   rows.forEach((item) => {
-    if (!item.matched_to_server) return;
     const source = String(item.source || "").toLowerCase();
     if (!String(item.source || "").includes("虚拟IP") && !source.includes("vip")) return;
     const ip = String(item.private_ip || "").trim();
@@ -3748,8 +3751,9 @@ function l2tpInstallVipValues() {
 async function refreshL2tpVipCandidates(serverId, prepareScan = true) {
   const query = prepareScan ? "" : "?prepare_scan=false";
   const result = await api(`/api/linux/servers/${serverId}/l2tp/vips${query}`);
-  state.linuxL2tpVipCandidates = result.items || [];
-  state.linuxL2tpVipCandidatesScanned = Boolean(prepareScan && result.items?.length);
+  state.linuxL2tpVipCandidates = result.candidate_items || result.items || [];
+  // An empty result is still a successful authoritative platform scan.
+  state.linuxL2tpVipCandidatesScanned = Boolean(prepareScan);
   renderL2tpVipCandidates();
   return result;
 }
@@ -3859,8 +3863,8 @@ function renderLinuxWorkspace(servers = [], selected = null) {
             <div class="linux-l2tp-compact">
               <div class="linux-l2tp-options">
                 <label>端口<input id="linuxL2tpPort" type="number" min="1" max="65535" value="1701"></label>
-                <label>MTU<input id="linuxL2tpMtu" type="number" min="576" max="1500" value="1400"></label>
-                <label>MRU<input id="linuxL2tpMru" type="number" min="576" max="1500" value="1400"></label>
+                <label>MTU<input id="linuxL2tpMtu" type="number" min="576" max="1500" value="1280"></label>
+                <label>MRU<input id="linuxL2tpMru" type="number" min="576" max="1500" value="1280"></label>
                 <label>PSK<input id="linuxL2tpPsk" placeholder="留空则关闭 IPsec/PSK"></label>
                 <label class="checkbox-field"><input id="linuxL2tpRandomPsk" type="checkbox">随机 PSK</label>
               </div>

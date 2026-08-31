@@ -205,8 +205,8 @@ class LinuxL2tpConfigBody(BaseModel):
 
 class LinuxL2tpInstallBody(BaseModel):
     port: int = Field(default=1701, ge=1, le=65535)
-    mtu: int = Field(default=1400, ge=576, le=1500)
-    mru: int = Field(default=1400, ge=576, le=1500)
+    mtu: int = Field(default=1280, ge=576, le=1500)
+    mru: int = Field(default=1280, ge=576, le=1500)
     psk: str = ""
     random_psk: bool = False
 
@@ -1360,6 +1360,34 @@ def _flatten_text(value: Any) -> str:
     return str(value)
 
 
+def _binding_value_matches(value: Any, expected_refs: set[str]) -> bool:
+    """Match cloud binding payloads by exact identifiers, never substrings."""
+    expected = {str(item).strip() for item in expected_refs if str(item).strip()}
+    if not expected or value in (None, "", []):
+        return False
+    candidates: set[str] = set()
+
+    def collect(item: Any) -> None:
+        if item in (None, "", []):
+            return
+        if isinstance(item, dict):
+            for nested in item.values():
+                collect(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                collect(nested)
+            return
+        text = str(item).strip()
+        if not text:
+            return
+        candidates.add(text)
+        candidates.update(re.findall(r"[A-Za-z0-9_.:@/-]+", text))
+
+    collect(value)
+    return bool(candidates & expected)
+
+
 def _first_payload_value(payload: dict[str, Any], keys: list[str]) -> Any:
     for key in keys:
         value = payload.get(key)
@@ -1526,7 +1554,9 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
             "refs": {ref for ref in refs if ref},
             "name": data.get("name") or payload.get("name") or "",
         })
+    server_host = str(server.get("host") or "").strip()
     eip_by_ref: dict[str, dict[str, Any]] = {}
+    server_eip_bindings: list[Any] = []
     for row in eip_rows:
         data = dict(row)
         payload = _decode_payload(data)
@@ -1537,10 +1567,13 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
         for ref in refs:
             if ref:
                 eip_by_ref[ref] = {"row": data, "payload": payload}
+        eip_ips = set(_public_ips([_resource_ip(payload), data.get("name"), payload.get("public_ip"), payload.get("publicIP")]))
+        if server_host and server_host in eip_ips:
+            binding = _first_payload_value(payload, ["bound_instances", "boundInstances", "instanceInfo", "instance_info", "ecs", "server"])
+            if binding not in (None, "", []):
+                server_eip_bindings.append(binding)
 
-    server_host = str(server.get("host") or "").strip()
     selected_ecs_refs: set[str] = set()
-    selected_ecs_private_ips: list[dict[str, Any]] = []
     probe_items: list[dict[str, Any]] = []
     ecs_records: list[dict[str, Any]] = []
     selected_contexts: set[tuple[str, str]] = set()
@@ -1568,7 +1601,9 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
             str(payload.get("public_ip") or payload.get("publicIP") or ""),
             str(payload.get("ip") or ""),
         }
-        matched_to_server = bool(server_host and server_host in values)
+        matched_to_server = bool(server_host and server_host in values) or any(
+            _binding_value_matches(binding, values) for binding in server_eip_bindings
+        )
         ecs_records.append({
             "data": data,
             "payload": payload,
@@ -1626,11 +1661,9 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
                 "synced_at": data.get("synced_at") or "",
             }
             probe_items.append(item)
-            if record["matched_to_server"]:
-                selected_ecs_private_ips.append(item)
 
     result: list[dict[str, Any]] = []
-    seen_private_ips: set[str] = set()
+    candidate_items: list[dict[str, Any]] = []
     unmatched_vip_count = 0
     for row in vip_rows:
         data = dict(row)
@@ -1641,7 +1674,8 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
             unmatched_vip_count += 1
             continue
         private_ip = _resource_ip(payload) or str(data.get("name") or "")
-        bound_instances = _flatten_text(_first_payload_value(payload, ["bound_instances", "boundInstances", "instanceInfo", "instance_info", "ecs", "server"]))
+        bound_instances_value = _first_payload_value(payload, ["bound_instances", "boundInstances", "instanceInfo", "instance_info", "ecs", "server"])
+        bound_instances = _flatten_text(bound_instances_value)
         bound_eips = _flatten_text(_first_payload_value(payload, ["bound_eips", "boundEips", "networkInfo", "network_info", "eip", "eips"]))
         public_ip = str(_first_payload_value(payload, ["public_ip", "publicIP", "eipAddress", "eip_ip"]) or "")
         if not public_ip:
@@ -1650,7 +1684,7 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
                     public_ip = _resource_ip(item["payload"]) or str(item["row"].get("name") or "")
                     if public_ip:
                         break
-        matched = bool(selected_ecs_refs and any(ref and ref in bound_instances for ref in selected_ecs_refs))
+        matched = _binding_value_matches(bound_instances_value, selected_ecs_refs)
         vip_item = {
             "account_id": data.get("account_id"),
             "account_name": account_names.get(int(data.get("account_id") or 0), ""),
@@ -1667,21 +1701,15 @@ def _l2tp_vip_candidates(server: dict[str, Any]) -> dict[str, Any]:
             "synced_at": data.get("synced_at") or "",
         }
         probe_items.append(vip_item)
+        candidate_items.append(vip_item)
         if not matched:
             unmatched_vip_count += 1
             continue
-        if private_ip:
-            seen_private_ips.add(private_ip)
         result.append(vip_item)
-    for item in selected_ecs_private_ips:
-        private_ip = str(item.get("private_ip") or "")
-        if not private_ip or private_ip in seen_private_ips:
-            continue
-        seen_private_ips.add(private_ip)
-        result.append(item)
     result.sort(key=lambda item: (not item["matched_to_server"], str(item["account_name"]), str(item["region"]), str(item["private_ip"])))
     return {
         "items": result,
+        "candidate_items": candidate_items,
         "probe_items": probe_items,
         "matched_ecs_count": matched_ecs_count,
         "excluded_ecs_count": excluded_ecs_count,

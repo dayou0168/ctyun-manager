@@ -32,7 +32,14 @@ SERVER_CONFIG_VARS=(
   VPN_MTU
   VPN_MRU
   VPN_IFACE
+  VPN_PRIMARY_IP
   VPN_VIPS
+  VPN_PLATFORM_SCAN
+  VPN_VIP_CANDIDATES
+  VPN_VIP_SCAN_RANGE
+  VPN_VIP_SCAN_MAX
+  VPN_VIP_SCAN_PARALLEL
+  VPN_VIP_PROBE_TARGET
   VPN_LEFT_ID
   VPN_ENABLE_IPSEC
   VPN_RANDOM_PSK
@@ -52,7 +59,7 @@ usage() {
 Usage:
   sudo bash $SCRIPT_NAME
 
-One-click L2TP server installer for Ubuntu, Debian, CentOS, Rocky, AlmaLinux, and RHEL-like systems.
+One-click L2TP server installer for Debian 9+, Ubuntu 18.04+, and CentOS 7/8/Stream 9.
 Default mode is L2TP username/password only, without IPsec/PSK.
 
 Common environment variables:
@@ -83,9 +90,9 @@ Persistent server config:
   Apply changes with: $APPLY_CONFIG_SCRIPT
 
 Network variables:
-  VPN_LOCAL_IP        L2TP server local tunnel IP. Default: 10.88.0.1.
-  VPN_CLIENT_POOL     Dynamic client pool. Default: 10.88.1.1-10.88.255.254.
-  VPN_CIDR            VPN client CIDR for forwarding/NAT. Default: 10.88.0.0/16.
+  VPN_LOCAL_IP        L2TP server local tunnel IP. Default: 172.18.0.1.
+  VPN_CLIENT_POOL     Dynamic client pool. Default: 172.18.0.2-172.18.255.254.
+  VPN_CIDR            VPN client CIDR for forwarding/NAT. Default: 172.18.0.0/16.
   VPN_L2TP_PORT       L2TP UDP port. Default: 1701.
   VPN_DNS1            DNS server pushed to clients. Default: 223.5.5.5.
   VPN_DNS2            DNS server pushed to clients. Default: 119.29.29.29.
@@ -93,16 +100,29 @@ Network variables:
   VPN_MRU             PPP MRU pushed by xl2tpd. Default: same as VPN_MTU.
   VPN_ENABLE_BBR      Try to enable TCP BBR before configuring L2TP. Default: 1.
   VPN_IFACE           Public/default network interface. Default: auto-detect.
+  VPN_PRIMARY_IP      Primary private IPv4 on VPN_IFACE. Default: route-source auto-detection.
   VPN_VIPS            Comma-separated local VIPs to add on VPN_IFACE, for example 172.16.0.11/32,172.16.0.12/32.
+  VPN_VIP_CANDIDATES  Platform-provided VIP candidates. With VPN_PLATFORM_SCAN=1, each address is temporarily
+                      added and tested with source-address ping before it is accepted into VPN_VIPS.
+  VPN_VIP_SCAN_RANGE  Optional scan scope: a single IP, CIDR, start-end range, or comma-separated combination.
+  VPN_VIP_SCAN_MAX    Maximum expanded scan addresses. Default: 512; allowed: 1-4096.
+  VPN_VIP_SCAN_PARALLEL Concurrent source-address ping probes per batch. Default: 32; allowed: 1-128.
+  VPN_VIP_PROBE_TARGET Ping target used for active VIP verification. Default: www.baidu.com.
   VPN_INGRESS_MODE    L2TP ingress mode: smart or bound. Default: smart.
                       smart = one xl2tpd listener plus DNAT for other local ingress IPs.
                       bound = one xl2tpd listener per local ingress IP.
   VPN_CLIENT_POOL_MODE Client pool mode: auto, global, or per_vip. Default: auto.
                       global = one shared pool, users.conf column 5 should usually be empty.
                       per_vip = in bound mode, use users.conf column 5 as the pool for that local VIP.
-  VPN_AUTO_CONFIG_FROM_USERS Automatically derive bound/per_vip and VPN_VIPS from users.conf. Default: 1.
+  VPN_AUTO_CONFIG_FROM_USERS Emergency compatibility switch that may derive VPN_VIPS from users.conf. Default: 0.
+                      Platform installs should keep this disabled and pass only the VIPs found by the cloud scan.
   VPN_INGRESS_IP      Local IP used by the single smart listener. Default: first IPv4 on VPN_IFACE.
   VPN_LEFT_ID         Optional strongSwan leftid. Leave empty for multi-EIP/VIP servers.
+
+Package source variables:
+  VPN_CONFIGURE_TUNA_MIRROR Switch supported system repositories to Tsinghua TUNA before installing. Default: 1.
+  VPN_TUNA_MIRROR      Mirror root. Default: http://mirrors.tuna.tsinghua.edu.cn.
+  VPN_APT_FORCE_IPV4   Force apt to use IPv4 and disable HTTP pipelining. Default: 1.
 
 Tianyi Cloud VIP/EIP example:
   sudo VPN_USERS='acct1:pass1:172.16.0.11:2::61.1.1.1,acct2:pass2:172.16.0.12:3::61.1.1.2' \\
@@ -115,12 +135,12 @@ Several accounts using the same local VIP:
     bash $SCRIPT_NAME
 
 Account with a dedicated client subnet:
-  sudo VPN_USERS='acct1:pass1:172.16.0.11:254:10.88.120.0/24:61.1.1.1' \\
+  sudo VPN_USERS='acct1:pass1:172.16.0.11:254:172.18.120.0/24:61.1.1.1' \\
     VPN_VIPS='172.16.0.11/32' \\
     bash $SCRIPT_NAME
 
 Account with a dedicated client IP range:
-  sudo VPN_USERS='acct3:pass3:172.16.0.11:20:10.88.1.61-10.88.1.80:61.1.1.1' \\
+  sudo VPN_USERS='acct3:pass3:172.16.0.11:20:172.18.1.61-172.18.1.80:61.1.1.1' \\
     VPN_VIPS='172.16.0.11/32' \\
     bash $SCRIPT_NAME
 
@@ -131,6 +151,7 @@ Enable IPsec with a random PSK:
   sudo VPN_RANDOM_PSK=1 bash $SCRIPT_NAME
 
 Notes:
+  - Debian 9/10 and CentOS 7/8 are EOL. The installer can use archive repositories, but those systems no longer receive normal security updates.
   - egress_local_vip is the private virtual IP configured on this server NIC.
   - share_count is the max simultaneous sessions for that username.
   - vpn_ip is optional and should usually stay empty. xl2tpd uses one global client pool, so per-user vpn_ip limits can reject users when they receive an address from another range.
@@ -215,11 +236,15 @@ prompt_interactive_config() {
   prompt_value VPN_L2TP_PORT "服务端 UDP 端口" "$VPN_L2TP_PORT"
   prompt_value VPN_MTU "MTU" "$VPN_MTU"
   prompt_value VPN_MRU "MRU" "$VPN_MRU"
-  prompt_value VPN_CIDR "VPN 客户端内网网段，例如 10.88.0.0/16" "$VPN_CIDR"
+  prompt_value VPN_CIDR "VPN 客户端内网网段，例如 172.18.0.0/16" "$VPN_CIDR"
   prompt_value VPN_LOCAL_IP "L2TP 服务端隧道 IP" "$VPN_LOCAL_IP"
-  prompt_value VPN_CLIENT_POOL "客户端地址池，例如 10.88.1.1-10.88.255.254" "$VPN_CLIENT_POOL"
+  prompt_value VPN_CLIENT_POOL "客户端地址池，例如 172.18.0.2-172.18.255.254" "$VPN_CLIENT_POOL"
   prompt_value VPN_DNS1 "客户端 DNS1" "$VPN_DNS1"
   prompt_value VPN_DNS2 "客户端 DNS2" "$VPN_DNS2"
+  if [ "${VPN_PLATFORM_SCAN:-0}" = "1" ]; then
+    prompt_value VPN_VIP_SCAN_RANGE "VIP 扫描范围（单个 IP、CIDR 或起止范围）" "${VPN_VIP_SCAN_RANGE:-${VPN_VIP_CANDIDATES:-}}"
+    prompt_value VPN_VIP_SCAN_PARALLEL "VIP 批量扫描并发数" "$VPN_VIP_SCAN_PARALLEL"
+  fi
   if [ -n "${VPN_VIPS:-}" ]; then
     echo "平台已扫描到额外虚拟内网 IP：$VPN_VIPS"
   else
@@ -374,7 +399,7 @@ client_ip_scope_capacity() {
     printf '%u\n' "$((end - start + 1))"
     return 0
   fi
-  fail "Invalid vpn_ip '$spec'. Use empty, a single IPv4 address, CIDR like 10.88.120.0/24, or a range like 10.88.1.61-10.88.1.80."
+  fail "Invalid vpn_ip '$spec'. Use empty, a single IPv4 address, CIDR like 172.18.120.0/24, or a range like 172.18.1.61-172.18.1.80."
 }
 
 validate_client_scope_inside_pool() {
@@ -450,7 +475,7 @@ vpn_client_pool_capacity() {
   local start_ip end_ip start_int end_int
   case "$VPN_CLIENT_POOL" in
     *-*) ;;
-    *) fail "VPN_CLIENT_POOL must be an IPv4 range like 10.88.1.1-10.88.255.254." ;;
+    *) fail "VPN_CLIENT_POOL must be an IPv4 range like 172.18.0.2-172.18.255.254." ;;
   esac
 
   start_ip="${VPN_CLIENT_POOL%-*}"
@@ -463,11 +488,38 @@ vpn_client_pool_capacity() {
   printf '%u\n' "$((end_int - start_int + 1))"
 }
 
+validate_vpn_network_layout() {
+  local bounds cidr_start cidr_end local_int pool_start pool_end
+  is_ipv4_cidr "$VPN_CIDR" || fail "VPN_CIDR must be an IPv4 CIDR such as 172.18.0.0/16."
+  bounds="$(cidr_bounds "$VPN_CIDR")"
+  cidr_start="${bounds%% *}"
+  cidr_end="${bounds#* }"
+  local_int="$(ipv4_to_int "$VPN_LOCAL_IP")"
+  case "$VPN_CLIENT_POOL" in
+    *-*) ;;
+    *) fail "VPN_CLIENT_POOL must be an IPv4 range like 172.18.0.2-172.18.255.254." ;;
+  esac
+  is_ipv4 "${VPN_CLIENT_POOL%-*}" || fail "Invalid VPN_CLIENT_POOL start IP '${VPN_CLIENT_POOL%-*}'."
+  is_ipv4 "${VPN_CLIENT_POOL#*-}" || fail "Invalid VPN_CLIENT_POOL end IP '${VPN_CLIENT_POOL#*-}'."
+  pool_start="$(ipv4_to_int "${VPN_CLIENT_POOL%-*}")"
+  pool_end="$(ipv4_to_int "${VPN_CLIENT_POOL#*-}")"
+  [ "$pool_end" -ge "$pool_start" ] || fail "VPN_CLIENT_POOL end IP must be greater than or equal to start IP."
+  if [ "$local_int" -lt "$cidr_start" ] || [ "$local_int" -gt "$cidr_end" ]; then
+    fail "VPN_LOCAL_IP '$VPN_LOCAL_IP' is outside VPN_CIDR '$VPN_CIDR'."
+  fi
+  if [ "$pool_start" -lt "$cidr_start" ] || [ "$pool_end" -gt "$cidr_end" ]; then
+    fail "VPN_CLIENT_POOL '$VPN_CLIENT_POOL' is outside VPN_CIDR '$VPN_CIDR'."
+  fi
+  if [ "$local_int" -ge "$pool_start" ] && [ "$local_int" -le "$pool_end" ]; then
+    fail "VPN_LOCAL_IP '$VPN_LOCAL_IP' must not be included in VPN_CLIENT_POOL '$VPN_CLIENT_POOL'."
+  fi
+}
+
 allocate_client_scope() {
   local __var="$1" count="$2" start_ip end_ip pool_start pool_end scope_start scope_end block_end host
   case "$VPN_CLIENT_POOL" in
     *-*) ;;
-    *) fail "VPN_CLIENT_POOL must be an IPv4 range like 10.88.1.1-10.88.255.254." ;;
+    *) fail "VPN_CLIENT_POOL must be an IPv4 range like 172.18.0.2-172.18.255.254." ;;
   esac
 
   start_ip="${VPN_CLIENT_POOL%-*}"
@@ -562,24 +614,526 @@ need_systemd() {
 
 detect_iface() {
   local iface
-  iface="$(ip -4 route list default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  iface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  if [ -z "$iface" ]; then
+    iface="$(ip -4 route list default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  fi
   [ -n "$iface" ] || fail "Could not auto-detect the default network interface. Set VPN_IFACE=eth0."
   printf '%s\n' "$iface"
 }
 
 detect_iface_ipv4s() {
-  local iface="$1"
-  ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | paste -sd, -
+  local iface="$1" requested_ip="${2:-}" route_line route_iface route_ip cidr
+  ip link show dev "$iface" >/dev/null 2>&1 || fail "VPN_IFACE '$iface' does not exist."
+
+  if [ -n "$requested_ip" ]; then
+    requested_ip="${requested_ip%%/*}"
+    is_ipv4 "$requested_ip" || fail "Invalid VPN_PRIMARY_IP '$requested_ip'."
+    cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null |
+      awk -v target="$requested_ip" '$4 ~ ("^" target "/") && $0 !~ / tentative| dadfailed/ {print $4; exit}')"
+    [ -n "$cidr" ] || fail "VPN_PRIMARY_IP '$requested_ip' is not a usable local IPv4 on $iface."
+    printf '%s\n' "$cidr"
+    return 0
+  fi
+
+  route_line="$(ip -4 route get 1.1.1.1 2>/dev/null | head -n 1 || true)"
+  route_iface="$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$route_line")"
+  route_ip="$(awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' <<<"$route_line")"
+  if [ "$route_iface" = "$iface" ] && is_ipv4 "$route_ip"; then
+    cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null |
+      awk -v target="$route_ip" '$4 ~ ("^" target "/") && $0 !~ / tentative| dadfailed/ {print $4; exit}')"
+  fi
+
+  if [ -z "${cidr:-}" ]; then
+    cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null |
+      awk '$0 !~ / secondary| tentative| dadfailed| deprecated/ {print $4; exit}')"
+  fi
+  if [ -z "${cidr:-}" ]; then
+    cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null |
+      awk '$0 !~ / tentative| dadfailed| deprecated/ {print $4; exit}')"
+  fi
+  [ -n "${cidr:-}" ] || fail "No usable global IPv4 was found on $iface. Set VPN_IFACE and VPN_PRIMARY_IP explicitly."
+  printf '%s\n' "$cidr"
+}
+
+expand_vip_scan_specs() {
+  local raw="$1" max_count="$2" spec bounds start end current count=0 output=""
+  local -a scan_specs=()
+  IFS=',' read -r -a scan_specs <<<"$raw"
+  for spec in "${scan_specs[@]}"; do
+    spec="$(printf '%s' "$spec" | xargs)"
+    [ -n "$spec" ] || continue
+    if is_ipv4 "$spec"; then
+      start="$(ipv4_to_int "$spec")"
+      end="$start"
+    elif is_ipv4_range "$spec"; then
+      start="$(ipv4_to_int "${spec%-*}")"
+      end="$(ipv4_to_int "${spec#*-}")"
+    elif is_ipv4_cidr "$spec"; then
+      bounds="$(cidr_bounds "$spec")"
+      start="${bounds%% *}"
+      end="${bounds#* }"
+    else
+      fail "Invalid VPN_VIP_SCAN_RANGE item '$spec'. Use an IPv4, CIDR, or start-end range."
+    fi
+    [ "$((end - start + 1))" -le "$((max_count - count))" ] || \
+      fail "VIP scan scope expands beyond VPN_VIP_SCAN_MAX=$max_count addresses. Narrow it or explicitly raise the limit."
+    for ((current=start; current<=end; current++)); do
+      output="${output:+$output,}$(int_to_ipv4 "$current")"
+      count=$((count + 1))
+    done
+  done
+  printf '%s\n' "$output"
+}
+
+verify_platform_vip_candidates() {
+  [ "${VPN_PLATFORM_SCAN:-0}" = "1" ] || return 0
+  local raw item candidate probe_target verified="" temp_dir offset index batch_end
+  local -a candidate_parts=() scan_ips=() existed_flags=()
+  probe_target="${VPN_VIP_PROBE_TARGET:-www.baidu.com}"
+  raw="${VPN_VIP_SCAN_RANGE:-${VPN_VIP_CANDIDATES:-}}"
+
+  # A platform scan is authoritative, including when it finds no usable VIPs.
+  VPN_VIPS=""
+  [ -n "$raw" ] || { log "Platform VIP scan found no candidates."; return 0; }
+  raw="$(expand_vip_scan_specs "$raw" "$VPN_VIP_SCAN_MAX")"
+
+  IFS=',' read -r -a candidate_parts <<<"$raw"
+  for item in "${candidate_parts[@]}"; do
+    candidate="${item%%/*}"
+    [ -n "$candidate" ] || continue
+    if [ "$candidate" = "${VPN_IFACE_IPV4S%%/*}" ]; then
+      log "Skipping primary interface address $candidate; it is not a VIP candidate."
+      continue
+    fi
+    if printf '%s\n' "${scan_ips[*]:-}" | grep -Fwq "$candidate"; then
+      continue
+    fi
+    if ip -o -4 addr show dev "$VPN_IFACE" | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$candidate"; then
+      scan_ips+=("$candidate")
+      existed_flags+=("1")
+    elif ip addr add "$candidate/32" dev "$VPN_IFACE"; then
+      scan_ips+=("$candidate")
+      existed_flags+=("0")
+    else
+      warn "Could not temporarily add VIP candidate $candidate to $VPN_IFACE."
+    fi
+  done
+
+  [ "${#scan_ips[@]}" -gt 0 ] || { log "No usable VIP candidates remained after validation."; return 0; }
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$temp_dir"' RETURN
+  sleep 1
+  log "Batch-verifying ${#scan_ips[@]} VIP candidate(s), concurrency=$VPN_VIP_SCAN_PARALLEL, target=$probe_target."
+  for ((offset=0; offset<${#scan_ips[@]}; offset+=VPN_VIP_SCAN_PARALLEL)); do
+    batch_end=$((offset + VPN_VIP_SCAN_PARALLEL))
+    [ "$batch_end" -le "${#scan_ips[@]}" ] || batch_end="${#scan_ips[@]}"
+    for ((index=offset; index<batch_end; index++)); do
+      candidate="${scan_ips[$index]}"
+      (ping -4 -I "$candidate" -c 2 -W 2 "$probe_target" >/dev/null 2>&1 && : >"$temp_dir/$index.ok") &
+    done
+    wait || true
+  done
+
+  for ((index=0; index<${#scan_ips[@]}; index++)); do
+    candidate="${scan_ips[$index]}"
+    if [ -f "$temp_dir/$index.ok" ]; then
+      verified="${verified:+$verified,}$candidate/32"
+      log "Verified platform VIP $candidate on $VPN_IFACE via $probe_target."
+    else
+      warn "VIP candidate $candidate failed the source-address ping to $probe_target."
+      if [ "${existed_flags[$index]}" = "0" ]; then
+        ip addr del "$candidate/32" dev "$VPN_IFACE" || warn "Could not remove failed temporary VIP $candidate."
+      fi
+    fi
+  done
+  rm -rf -- "$temp_dir"
+  trap - RETURN
+  VPN_VIPS="$verified"
+  log "Active platform VIP verification result: ${VPN_VIPS:-none}."
+}
+
+detect_system() {
+  [ -r /etc/os-release ] || fail "/etc/os-release was not found; cannot identify this Linux distribution."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="$(printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')"
+  OS_ID_LIKE="$(printf '%s' "${ID_LIKE:-}" | tr '[:upper:]' '[:lower:]')"
+  OS_VERSION_ID="${VERSION_ID:-}"
+  OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  OS_ARCH="$(uname -m)"
+
+  case "$OS_ID" in
+    debian|ubuntu) OS_FAMILY="apt" ;;
+    centos) OS_FAMILY="rhel" ;;
+    *)
+      case " $OS_ID_LIKE " in
+        *" debian "*) OS_FAMILY="apt" ;;
+        *" centos "*) OS_FAMILY="rhel" ;;
+        *) fail "Unsupported Linux distribution '$OS_ID'. Supported: Debian, Ubuntu, and CentOS 7/8/Stream 9." ;;
+      esac
+      ;;
+  esac
+
+  case "$OS_ID" in
+    debian)
+      [ "${OS_VERSION_ID%%.*}" -ge 9 ] 2>/dev/null || fail "Debian 9 or newer is required."
+      ;;
+    ubuntu)
+      [ "${OS_VERSION_ID%%.*}" -ge 18 ] 2>/dev/null || fail "Ubuntu 18.04 or newer is required."
+      ;;
+    centos)
+      case "${OS_VERSION_ID%%.*}" in 7|8|9) ;; *) fail "Supported CentOS versions: 7, 8, and Stream 9." ;; esac
+      ;;
+  esac
+  log "Detected system: ${PRETTY_NAME:-$OS_ID $OS_VERSION_ID} ($OS_ARCH)."
+}
+
+apt_get() {
+  if [ "${VPN_APT_FORCE_IPV4:-1}" = "1" ]; then
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Pipeline-Depth=0 "$@"
+  else
+    apt-get "$@"
+  fi
+}
+
+configure_apt_tuna_mirror() {
+  local mirror="$VPN_TUNA_MIRROR" codename="$OS_CODENAME" components archive stamp source_file
+  [ -n "$codename" ] || fail "Could not determine the distribution codename from /etc/os-release."
+  stamp="$(date +%Y%m%d%H%M%S)"
+  install -d -m 755 /etc/apt/sources.list.d /etc/apt/apt.conf.d
+
+  for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/ubuntu.sources; do
+    [ -e "$source_file" ] || continue
+    cp -a "$source_file" "${source_file}.ctyun-backup.$stamp"
+  done
+  printf '# Managed by ctyun L2TP installer. Original file has a .ctyun-backup.%s copy.\n' "$stamp" >/etc/apt/sources.list
+  for source_file in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/ubuntu.sources; do
+    [ -e "$source_file" ] || continue
+    mv "$source_file" "${source_file}.ctyun-disabled.$stamp"
+  done
+
+  case "$OS_ID" in
+    ubuntu)
+      components="main restricted universe multiverse"
+      case "$OS_ARCH" in
+        x86_64|i386|i486|i586|i686) archive="ubuntu" ;;
+        *) archive="ubuntu-ports" ;;
+      esac
+      cat >/etc/apt/sources.list.d/ctyun-tuna.sources <<EOF
+Types: deb deb-src
+URIs: $mirror/$archive
+Suites: $codename ${codename}-updates ${codename}-backports ${codename}-security
+Components: $components
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+      ;;
+    debian)
+      components="main contrib non-free"
+      if [ "${OS_VERSION_ID%%.*}" -ge 12 ] 2>/dev/null; then
+        components="$components non-free-firmware"
+      fi
+      if [ "${OS_VERSION_ID%%.*}" -le 10 ] 2>/dev/null; then
+        cat >/etc/apt/sources.list.d/ctyun-tuna.sources <<EOF
+Types: deb deb-src
+URIs: http://archive.debian.org/debian
+Suites: $codename ${codename}-backports
+Components: $components
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+
+Types: deb deb-src
+URIs: http://archive.debian.org/debian-security
+Suites: ${codename}/updates
+Components: $components
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Check-Valid-Until: no
+EOF
+        log "WARNING: Debian $OS_VERSION_ID is EOL and no longer exists on TUNA; using Debian's HTTP archive. It receives no security updates."
+      else
+        cat >/etc/apt/sources.list.d/ctyun-tuna.sources <<EOF
+Types: deb deb-src
+URIs: $mirror/debian
+Suites: $codename ${codename}-updates ${codename}-backports
+Components: $components
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb deb-src
+URIs: $mirror/debian-security
+Suites: ${codename}-security
+Components: $components
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+      fi
+      ;;
+    *) fail "TUNA apt source generation is supported only for Debian and Ubuntu, not '$OS_ID'." ;;
+  esac
+
+  if [ "${VPN_APT_FORCE_IPV4:-1}" = "1" ]; then
+    cat >/etc/apt/apt.conf.d/99ctyun-tuna-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::http::Pipeline-Depth "0";
+EOF
+  fi
+  if [ "$OS_ID" = "debian" ] && [ "${OS_VERSION_ID%%.*}" -le 10 ] 2>/dev/null; then
+    log "Configured Debian HTTP archive with binary/source/non-free repositories."
+  else
+    log "Configured TUNA apt mirror ($mirror, HTTP, IPv4, source repositories, non-free components, mirrored security updates)."
+  fi
+}
+
+enable_yum_source_repos() {
+  local file tmp
+  for file in /etc/yum.repos.d/*.repo; do
+    [ -f "$file" ] || continue
+    tmp="$(mktemp)"
+    awk '
+      /^\[/ { source = (tolower($0) ~ /source/) }
+      source && /^enabled[[:space:]]*=/ { print "enabled=1"; next }
+      { print }
+    ' "$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+  done
+}
+
+disable_centos_repo_files() {
+  local stamp="$1" repo_file
+  for repo_file in /etc/yum.repos.d/CentOS-*.repo /etc/yum.repos.d/centos*.repo; do
+    [ -f "$repo_file" ] || continue
+    mv "$repo_file" "${repo_file}.ctyun-disabled.$stamp"
+  done
+}
+
+write_centos_vault_repos() {
+  local major="$1" mirror="$2" release_path gpg_key
+  case "$major" in
+    7)
+      release_path="7.9.2009"
+      gpg_key="file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7"
+      cat >/etc/yum.repos.d/ctyun-tuna-centos-vault.repo <<EOF
+[base]
+name=CentOS 7 - Base - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/os/\$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[base-source]
+name=CentOS 7 - Base Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/os/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[updates]
+name=CentOS 7 - Updates - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/updates/\$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[updates-source]
+name=CentOS 7 - Updates Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/updates/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[extras]
+name=CentOS 7 - Extras - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/extras/\$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[extras-source]
+name=CentOS 7 - Extras Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/extras/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+EOF
+      ;;
+    8)
+      release_path="8.5.2111"
+      gpg_key="file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial"
+      cat >/etc/yum.repos.d/ctyun-tuna-centos-vault.repo <<EOF
+[baseos]
+name=CentOS 8 - BaseOS - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/BaseOS/\$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[baseos-source]
+name=CentOS 8 - BaseOS Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/BaseOS/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[appstream]
+name=CentOS 8 - AppStream - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/AppStream/\$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[appstream-source]
+name=CentOS 8 - AppStream Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/AppStream/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[powertools]
+name=CentOS 8 - PowerTools - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/PowerTools/\$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[powertools-source]
+name=CentOS 8 - PowerTools Source - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/PowerTools/Source/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+
+[extras]
+name=CentOS 8 - Extras - TUNA Vault
+baseurl=$mirror/centos-vault/$release_path/extras/\$basearch/os/
+enabled=1
+gpgcheck=1
+gpgkey=$gpg_key
+EOF
+      ;;
+  esac
+  log "WARNING: CentOS $major is EOL. TUNA Vault is static and receives no security updates."
+}
+
+configure_rhel_tuna_mirror() {
+  local mirror="$VPN_TUNA_MIRROR" stamp repo_file major
+  stamp="$(date +%Y%m%d%H%M%S)"
+  major="${OS_VERSION_ID%%.*}"
+  [ -d /etc/yum.repos.d ] || fail "/etc/yum.repos.d was not found."
+  cp -a /etc/yum.repos.d "/etc/yum.repos.d.ctyun-backup.$stamp"
+
+  case "$OS_ID" in
+    rocky)
+      for repo_file in /etc/yum.repos.d/*.repo; do
+        [ -f "$repo_file" ] || continue
+        sed -Ei \
+          -e 's|^([[:space:]]*)mirrorlist=|\1#mirrorlist=|' \
+          -e 's|^([[:space:]]*)metalink=|\1#metalink=|' \
+          -e 's|^([[:space:]]*)#baseurl=|\1baseurl=|' \
+          -e "s|https?://(dl|download)\\.rockylinux\\.org/(pub/)?rocky|$mirror/rocky|g" \
+          "$repo_file"
+      done
+      ;;
+    almalinux)
+      for repo_file in /etc/yum.repos.d/*.repo; do
+        [ -f "$repo_file" ] || continue
+        sed -Ei \
+          -e 's|^([[:space:]]*)mirrorlist=|\1#mirrorlist=|' \
+          -e 's|^([[:space:]]*)metalink=|\1#metalink=|' \
+          -e 's|^([[:space:]]*)#baseurl=|\1baseurl=|' \
+          -e "s|https?://repo\\.almalinux\\.org/almalinux|$mirror/almalinux|g" \
+          "$repo_file"
+      done
+      ;;
+    centos)
+      disable_centos_repo_files "$stamp"
+      if [ "$major" = "7" ] || [ "$major" = "8" ]; then
+        write_centos_vault_repos "$major" "$mirror"
+      else
+        [ "$major" = "9" ] || fail "Supported CentOS versions: 7, 8, and Stream 9."
+      cat >/etc/yum.repos.d/ctyun-tuna-centos-stream.repo <<EOF
+[baseos]
+name=CentOS Stream 9 - BaseOS - TUNA
+baseurl=$mirror/centos-stream/9-stream/BaseOS/\$basearch/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[baseos-source]
+name=CentOS Stream 9 - BaseOS Source - TUNA
+baseurl=$mirror/centos-stream/9-stream/BaseOS/source/tree/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[appstream]
+name=CentOS Stream 9 - AppStream - TUNA
+baseurl=$mirror/centos-stream/9-stream/AppStream/\$basearch/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[appstream-source]
+name=CentOS Stream 9 - AppStream Source - TUNA
+baseurl=$mirror/centos-stream/9-stream/AppStream/source/tree/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[crb]
+name=CentOS Stream 9 - CRB - TUNA
+baseurl=$mirror/centos-stream/9-stream/CRB/\$basearch/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[crb-source]
+name=CentOS Stream 9 - CRB Source - TUNA
+baseurl=$mirror/centos-stream/9-stream/CRB/source/tree/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+[extras-common]
+name=CentOS Stream 9 - Extras - TUNA
+baseurl=$mirror/centos-stream/SIGs/9-stream/extras/\$basearch/extras-common
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-Extras-SHA512
+EOF
+      fi
+      ;;
+    rhel)
+      fail "RHEL base repositories require a Red Hat subscription and are not mirrored by TUNA. Set VPN_CONFIGURE_TUNA_MIRROR=0 to keep registered RHEL repositories."
+      ;;
+    *) fail "TUNA yum source generation is not implemented for '$OS_ID'." ;;
+  esac
+  enable_yum_source_repos
+  log "Configured TUNA repositories for $OS_ID $OS_VERSION_ID ($mirror, HTTP, source repositories enabled)."
+}
+
+configure_package_sources() {
+  VPN_CONFIGURE_TUNA_MIRROR="${VPN_CONFIGURE_TUNA_MIRROR:-1}"
+  VPN_TUNA_MIRROR="${VPN_TUNA_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
+  VPN_APT_FORCE_IPV4="${VPN_APT_FORCE_IPV4:-1}"
+  case "$VPN_CONFIGURE_TUNA_MIRROR" in 0|1) ;; *) fail "VPN_CONFIGURE_TUNA_MIRROR must be 0 or 1." ;; esac
+  case "$VPN_APT_FORCE_IPV4" in 0|1) ;; *) fail "VPN_APT_FORCE_IPV4 must be 0 or 1." ;; esac
+  if [ "$VPN_CONFIGURE_TUNA_MIRROR" = "0" ]; then
+    log "Keeping existing package repositories."
+    return 0
+  fi
+  case "$OS_FAMILY" in
+    apt) configure_apt_tuna_mirror ;;
+    rhel) configure_rhel_tuna_mirror ;;
+  esac
 }
 
 install_debian_packages() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
+  apt_get update
   local packages=(ca-certificates curl iproute2 iptables openssl ppp sed xl2tpd)
   if [ "$VPN_ENABLE_IPSEC" = "1" ]; then
     packages+=(strongswan)
   fi
-  apt-get install -y --no-install-recommends "${packages[@]}"
+  apt_get install -y --no-install-recommends "${packages[@]}"
 }
 
 enable_epel_if_needed() {
@@ -591,9 +1145,56 @@ enable_epel_if_needed() {
   "$pm" install -y epel-release && return 0
 
   local major
-  major="$(. /etc/os-release && printf '%s' "${VERSION_ID%%.*}")"
+  major="${OS_VERSION_ID%%.*}"
   [ -n "$major" ] || fail "Could not determine EL major version for EPEL."
-  "$pm" install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${major}.noarch.rpm"
+  if [ "$OS_ID" = "centos" ] && [ "$major" = "7" ]; then
+    "$pm" install -y "http://archives.fedoraproject.org/pub/archive/epel/7/x86_64/Packages/e/epel-release-7-14.noarch.rpm"
+    return 0
+  fi
+  "$pm" install -y "$VPN_TUNA_MIRROR/epel/epel-release-latest-${major}.noarch.rpm"
+}
+
+configure_epel_tuna_mirror() {
+  local repo_file stamp
+  [ "${VPN_CONFIGURE_TUNA_MIRROR:-1}" = "1" ] || return 0
+  if [ "$OS_ID" = "centos" ] && [ "${OS_VERSION_ID%%.*}" = "7" ]; then
+    stamp="$(date +%Y%m%d%H%M%S)"
+    for repo_file in /etc/yum.repos.d/epel*.repo; do
+      [ -f "$repo_file" ] || continue
+      mv "$repo_file" "${repo_file}.ctyun-disabled.$stamp"
+    done
+    cat >/etc/yum.repos.d/ctyun-epel-archive.repo <<'EOF'
+[epel]
+name=EPEL 7 Archive
+baseurl=http://archives.fedoraproject.org/pub/archive/epel/7/$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+
+[epel-source]
+name=EPEL 7 Source Archive
+baseurl=http://archives.fedoraproject.org/pub/archive/epel/7/SRPMS/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+EOF
+    log "WARNING: TUNA no longer carries EPEL 7; using Fedora's HTTP EPEL archive. It receives no security updates."
+    return 0
+  fi
+  if [ -f /etc/yum.repos.d/epel-cisco-openh264.repo ]; then
+    sed -Ei 's/^enabled[[:space:]]*=.*/enabled=0/' /etc/yum.repos.d/epel-cisco-openh264.repo
+  fi
+  for repo_file in /etc/yum.repos.d/epel*.repo; do
+    [ "$(basename "$repo_file")" = "epel-cisco-openh264.repo" ] && continue
+    [ -f "$repo_file" ] || continue
+    sed -Ei \
+      -e 's|^([[:space:]]*)metalink=|\1#metalink=|' \
+      -e 's|^([[:space:]]*)#baseurl=|\1baseurl=|' \
+      -e "s|https?://download\\.fedoraproject\\.org/pub/epel|$VPN_TUNA_MIRROR/epel|g" \
+      -e "s|https?://download\\.example/pub/epel|$VPN_TUNA_MIRROR/epel|g" \
+      "$repo_file"
+  done
+  enable_yum_source_repos
 }
 
 enable_rhel_optional_repos() {
@@ -612,8 +1213,13 @@ install_rhel_packages() {
   pm="$(command -v dnf || command -v yum || true)"
   [ -n "$pm" ] || fail "dnf/yum was not found."
 
+  "$pm" clean all >/dev/null 2>&1 || true
+  "$pm" makecache -y
   "$pm" install -y ca-certificates curl iproute iptables openssl sed
   enable_epel_if_needed "$pm"
+  configure_epel_tuna_mirror
+  "$pm" clean all >/dev/null 2>&1 || true
+  "$pm" makecache -y
   enable_rhel_optional_repos
   local packages=(xl2tpd ppp iptables-services)
   if [ "$VPN_ENABLE_IPSEC" = "1" ]; then
@@ -623,19 +1229,22 @@ install_rhel_packages() {
 }
 
 install_packages() {
-  if command -v apt-get >/dev/null 2>&1; then
+  detect_system
+  configure_package_sources
+
+  if [ "$OS_FAMILY" = "apt" ] && command -v apt-get >/dev/null 2>&1; then
     log "Installing packages with apt..."
     install_debian_packages
     return 0
   fi
 
-  if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+  if [ "$OS_FAMILY" = "rhel" ] && { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; }; then
     log "Installing packages with dnf/yum..."
     install_rhel_packages
     return 0
   fi
 
-  fail "Unsupported system. This installer supports Debian/Ubuntu and RHEL/CentOS-like systems."
+  fail "The expected package manager for $OS_ID was not found."
 }
 
 backup_file() {
@@ -727,6 +1336,7 @@ write_server_config() {
     echo "# 默认出网网卡，以及这张网卡当前已经存在的 IPv4。"
     echo "# 主网卡 IP 已经在系统里，不需要写入 VPN_VIPS。"
     printf 'VPN_IFACE=%s\n' "$(shell_quote "$VPN_IFACE")"
+    printf 'VPN_PRIMARY_IP=%s\n' "$(shell_quote "${VPN_PRIMARY_IP:-}")"
     printf 'VPN_IFACE_IPV4S=%s\n' "$(shell_quote "${VPN_IFACE_IPV4S:-}")"
     echo
     echo "# 额外需要添加到网卡上的虚拟内网 IP，多个用英文逗号分隔。"
@@ -737,8 +1347,8 @@ write_server_config() {
     printf 'VPN_INGRESS_MODE=%s\n' "$(shell_quote "${VPN_INGRESS_MODE:-smart}")"
     echo "# Client pool mode: auto/global/per_vip. per_vip requires VPN_INGRESS_MODE=bound and one client pool per local VIP."
     printf 'VPN_CLIENT_POOL_MODE=%s\n' "$(shell_quote "${VPN_CLIENT_POOL_MODE:-auto}")"
-    echo "# Automatically derive bound/per_vip and VPN_VIPS from users.conf when dedicated client IPs or pools are used."
-    printf 'VPN_AUTO_CONFIG_FROM_USERS=%s\n' "$(shell_quote "${VPN_AUTO_CONFIG_FROM_USERS:-1}")"
+    echo "# Emergency compatibility only. Platform scans are the authoritative source of VPN_VIPS."
+    printf 'VPN_AUTO_CONFIG_FROM_USERS=%s\n' "$(shell_quote "${VPN_AUTO_CONFIG_FROM_USERS:-0}")"
     printf 'VPN_INGRESS_IP=%s\n' "$(shell_quote "${VPN_INGRESS_IP:-${L2TP_INGRESS_IP:-}}")"
     printf 'VPN_LEFT_ID=%s\n' "$(shell_quote "${VPN_LEFT_ID:-}")"
     printf 'VPN_ENABLE_IPSEC=%s\n' "$(shell_quote "$VPN_ENABLE_IPSEC")"
@@ -1249,11 +1859,11 @@ enforce_online_sessions() {
   done <"$USER_MAP_PATH"
 }
 
-VPN_CLIENT_POOL="10.88.1.1-10.88.255.254"
+VPN_CLIENT_POOL="172.18.0.2-172.18.255.254"
 VPN_DEFAULT_SHARE_COUNT="1"
 VPN_INGRESS_MODE="smart"
 VPN_CLIENT_POOL_MODE="auto"
-VPN_AUTO_CONFIG_FROM_USERS="1"
+VPN_AUTO_CONFIG_FROM_USERS="0"
 if [ -f "$SERVER_CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
   source "$SERVER_CONFIG_FILE"
@@ -1434,7 +2044,7 @@ vip_list_has_ip() {
 }
 
 auto_config_from_users() {
-  [ "${VPN_AUTO_CONFIG_FROM_USERS:-1}" = "1" ] || return 0
+  [ "${VPN_AUTO_CONFIG_FROM_USERS:-0}" = "1" ] || return 0
   local i egress_ip client_scope has_dedicated=0 added_vips=0
 
   for i in "${!USER_NAMES[@]}"; do
@@ -1522,7 +2132,7 @@ pool_chunk_for_index() {
   end_block="$((pool_end >> 8))"
   total_blocks="$((end_block - start_block + 1))"
   chunk_start_block="$((start_block + (index * total_blocks / count)))"
-  chunk_end_block="$((start_block + (((index + 1) * total_blocks / count)) - 1))"
+  chunk_end_block="$((start_block + ((index + 1) * total_blocks / count) - 1))"
   [ "$chunk_end_block" -ge "$chunk_start_block" ] || chunk_end_block="$chunk_start_block"
   chunk_start="$((chunk_start_block * 256 + 1))"
   chunk_end="$((chunk_end_block * 256 + 254))"
@@ -2070,7 +2680,7 @@ EOF
     printf 'VPN_L2TP_PORT=%s\n' "$(shell_quote "$VPN_L2TP_PORT")"
     printf 'VPN_INGRESS_MODE=%s\n' "$(shell_quote "${VPN_INGRESS_MODE:-smart}")"
     printf 'VPN_CLIENT_POOL_MODE=%s\n' "$(shell_quote "${VPN_CLIENT_POOL_MODE:-auto}")"
-    printf 'VPN_AUTO_CONFIG_FROM_USERS=%s\n' "$(shell_quote "${VPN_AUTO_CONFIG_FROM_USERS:-1}")"
+    printf 'VPN_AUTO_CONFIG_FROM_USERS=%s\n' "$(shell_quote "${VPN_AUTO_CONFIG_FROM_USERS:-0}")"
     printf 'VPN_INGRESS_IP=%s\n' "$(shell_quote "${L2TP_INGRESS_IP:-${VPN_INGRESS_IP:-}}")"
     printf 'USER_MAP_PATH=%s\n' "$(shell_quote "$USER_MAP_PATH")"
     printf 'VPN_DISABLE_DEFAULT_MASQ=%s\n' "$(shell_quote "${VPN_DISABLE_DEFAULT_MASQ:-0}")"
@@ -2563,18 +3173,25 @@ main() {
   fi
   rm -f "$env_overrides"
 
-  VPN_LOCAL_IP="${VPN_LOCAL_IP:-10.88.0.1}"
-  VPN_CLIENT_POOL="${VPN_CLIENT_POOL:-10.88.1.1-10.88.255.254}"
-  VPN_CIDR="${VPN_CIDR:-10.88.0.0/16}"
+  VPN_LOCAL_IP="${VPN_LOCAL_IP:-172.18.0.1}"
+  VPN_CLIENT_POOL="${VPN_CLIENT_POOL:-172.18.0.2-172.18.255.254}"
+  VPN_CIDR="${VPN_CIDR:-172.18.0.0/16}"
   VPN_L2TP_PORT="${VPN_L2TP_PORT:-1701}"
   VPN_DNS1="${VPN_DNS1:-223.5.5.5}"
   VPN_DNS2="${VPN_DNS2:-119.29.29.29}"
   VPN_MTU="${VPN_MTU:-1280}"
   VPN_MRU="${VPN_MRU:-$VPN_MTU}"
+  VPN_PRIMARY_IP="${VPN_PRIMARY_IP:-}"
   VPN_VIPS="${VPN_VIPS:-}"
+  VPN_PLATFORM_SCAN="${VPN_PLATFORM_SCAN:-0}"
+  VPN_VIP_CANDIDATES="${VPN_VIP_CANDIDATES:-}"
+  VPN_VIP_SCAN_RANGE="${VPN_VIP_SCAN_RANGE:-}"
+  VPN_VIP_SCAN_MAX="${VPN_VIP_SCAN_MAX:-512}"
+  VPN_VIP_SCAN_PARALLEL="${VPN_VIP_SCAN_PARALLEL:-32}"
+  VPN_VIP_PROBE_TARGET="${VPN_VIP_PROBE_TARGET:-www.baidu.com}"
   VPN_INGRESS_MODE="${VPN_INGRESS_MODE:-smart}"
   VPN_CLIENT_POOL_MODE="${VPN_CLIENT_POOL_MODE:-auto}"
-  VPN_AUTO_CONFIG_FROM_USERS="${VPN_AUTO_CONFIG_FROM_USERS:-1}"
+  VPN_AUTO_CONFIG_FROM_USERS="${VPN_AUTO_CONFIG_FROM_USERS:-0}"
   VPN_ENABLE_BBR="${VPN_ENABLE_BBR:-1}"
 
   prompt_interactive_config
@@ -2598,7 +3215,10 @@ main() {
     0|1) ;;
     *) fail "VPN_AUTO_CONFIG_FROM_USERS must be 0 or 1." ;;
   esac
+  validate_number_between VPN_VIP_SCAN_MAX "$VPN_VIP_SCAN_MAX" 1 4096
+  validate_number_between VPN_VIP_SCAN_PARALLEL "$VPN_VIP_SCAN_PARALLEL" 1 128
   is_ipv4 "$VPN_LOCAL_IP" || fail "Invalid VPN_LOCAL_IP '$VPN_LOCAL_IP'."
+  validate_vpn_network_layout
   resolve_ipsec_settings
 
   parse_users
@@ -2612,7 +3232,8 @@ main() {
 
   command -v ip >/dev/null 2>&1 || fail "ip command was not found."
   VPN_IFACE="${VPN_IFACE:-$(detect_iface)}"
-  VPN_IFACE_IPV4S="$(detect_iface_ipv4s "$VPN_IFACE")"
+  VPN_IFACE_IPV4S="$(detect_iface_ipv4s "$VPN_IFACE" "$VPN_PRIMARY_IP")"
+  verify_platform_vip_candidates
   auto_config_from_users
   resolve_ingress_ip
   VPN_INGRESS_IP="$L2TP_INGRESS_IP"

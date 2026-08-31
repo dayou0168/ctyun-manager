@@ -73,6 +73,9 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - `server.conf` 会记录当前默认网卡 `VPN_IFACE` 和这张网卡已有 IPv4 `VPN_IFACE_IPV4S`，例如主网卡 `192.168.0.101/24`；主网卡 IP 已经在系统中，不写入 `VPN_VIPS`。
   - 平台“安装/更新脚本”会先执行当前服务器子网扫描逻辑；扫描成功后只把结果中的 `resource_type=vip` 虚拟内网 IP 写入 `VPN_VIPS`，安装脚本会把这些额外 VIP 加到服务器网卡并持久化到 helper。
   - L2TP 安装脚本在有终端输入时默认进入交互式确认，会停下来让用户输入/确认服务端端口、MTU、MRU、VPN 客户端内网网段、服务端隧道 IP、客户端地址池、DNS、额外虚拟内网 IP、是否启用 IPsec/PSK；可用 `VPN_INTERACTIVE=0` 关闭交互。
+  - L2TP 默认隧道网段为 `172.18.0.0/16`，服务端地址为 `172.18.0.1`，客户端地址池为 `172.18.0.2-172.18.255.254`，MTU/MRU 默认均为 `1280`；脚本会校验网关和客户端池必须位于 `VPN_CIDR` 内。
+  - 主网卡 IPv4 不再收集网卡上的全部 global 地址，而是优先读取实际默认路由的 `src` 地址，仅把该地址记录为 `VPN_IFACE_IPV4S`。平台先按“公网 EIP → 当前 ECS → 所在子网”枚举虚拟 IP 候选，并通过 `VPN_VIP_CANDIDATES` 交给安装脚本；交互安装开始前可用 `VPN_VIP_SCAN_RANGE` 修改扫描范围，支持单 IP、CIDR、起止范围及逗号组合，默认最多展开 512 个地址。脚本先批量临时添加候选地址，再以默认 32 路并发执行 `ping -4 -I <候选IP> www.baidu.com`，仅将成功的地址保留并写入 `VPN_VIPS`，失败的临时地址立即删除。扫描结果为空时也会清空旧值；`users.conf` 只能选择验证成功的出口 VIP，默认不能据此创建或绑定新 VIP。脱离平台直接运行脚本时，管理员仍可通过环境变量 `VPN_VIPS` 做应急覆盖。必要时可用 `VPN_PRIMARY_IP` 明确指定主内网 IP。
+  - L2TP 安装支持 Debian 9+、Ubuntu 18.04+、CentOS 7/8/Stream 9。安装依赖前默认切换为清华 HTTP 镜像，APT 强制 IPv4、启用源码源与非自由组件并强制安全更新走镜像；原源均保留带时间戳的备份。Debian 9/10 和 CentOS 7/8 已 EOL，其中清华不再保存 Debian 9/10 与 EPEL 7，脚本会对这两部分使用官方 HTTP 归档并打印无安全更新警告。
 - RustDesk 定制工具：
   - 左侧 `应用工具 / RustDesk 定制`。
   - 后端接口：`/api/tools/rustdesk/jobs`。
@@ -93,7 +96,7 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - 当前线上目录：`/www/wwwroot/ctyun-manager`
   - 当前 systemd 服务：`ctyun-manager`
   - L2TP 最新脚本下载入口：`/install-l2tp-server.sh`
-  - L2TP 最新脚本 SHA256：`c79c5281f65a2deced33a8476a463cb0174d4da1a62d365bdcee8499a371fba8`
+  - L2TP 最新脚本 SHA256：`99c53c66c243609d8e07dd589899f8fd8d56808adae687de9da8ccc444fe7dd4`
   - VPC/子网/虚拟 IP/安全组/ECS/EIP 表格行已带稳定 `data-resource-key`，后台确认失败、未确认、删除完成优先做行级状态更新或移除，不再为了单个资源操作重绘整页。
   - 虚拟 IP 行会根据已同步绑定字段显示“绑定/解绑云主机”和“绑定/解绑弹性IP”；解绑优先复用已识别的云主机网卡 ID / floatingID，识别不到时再弹窗让用户选择。
   - 操作未确认状态已改成黄色“待官方确认/删除待确认”，失败状态为红色；状态悬停显示具体 API 错误或“官方列表仍存在”等原因。
