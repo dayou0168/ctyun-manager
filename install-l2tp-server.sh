@@ -168,6 +168,10 @@ log() {
   printf '[l2tp] %s\n' "$*"
 }
 
+warn() {
+  printf '[l2tp] WARNING: %s\n' "$*" >&2
+}
+
 fail() {
   printf '[l2tp] ERROR: %s\n' "$*" >&2
   exit 1

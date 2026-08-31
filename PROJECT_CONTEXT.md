@@ -96,7 +96,7 @@ C:\Users\Administrator\Documents\Codex\2026-06-08\ip\outputs\ctyun-manager
   - 当前线上目录：`/www/wwwroot/ctyun-manager`
   - 当前 systemd 服务：`ctyun-manager`
   - L2TP 最新脚本下载入口：`/install-l2tp-server.sh`
-  - L2TP 最新脚本 SHA256：`99c53c66c243609d8e07dd589899f8fd8d56808adae687de9da8ccc444fe7dd4`
+  - L2TP 最新脚本 SHA256：`8f5b374ab85359ffdd7b918d3de74caf16f9137b84a060404eeebb3638585c9c`
   - VPC/子网/虚拟 IP/安全组/ECS/EIP 表格行已带稳定 `data-resource-key`，后台确认失败、未确认、删除完成优先做行级状态更新或移除，不再为了单个资源操作重绘整页。
   - 虚拟 IP 行会根据已同步绑定字段显示“绑定/解绑云主机”和“绑定/解绑弹性IP”；解绑优先复用已识别的云主机网卡 ID / floatingID，识别不到时再弹窗让用户选择。
   - 操作未确认状态已改成黄色“待官方确认/删除待确认”，失败状态为红色；状态悬停显示具体 API 错误或“官方列表仍存在”等原因。
