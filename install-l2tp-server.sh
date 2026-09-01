@@ -40,6 +40,7 @@ SERVER_CONFIG_VARS=(
   VPN_VIP_SCAN_MAX
   VPN_VIP_SCAN_PARALLEL
   VPN_VIP_PROBE_TARGET
+  VPN_PLATFORM_SCAN_CLEAN_STALE
   VPN_LEFT_ID
   VPN_ENABLE_IPSEC
   VPN_RANDOM_PSK
@@ -108,6 +109,7 @@ Network variables:
   VPN_VIP_SCAN_MAX    Maximum expanded scan addresses. Default: 512; allowed: 1-4096.
   VPN_VIP_SCAN_PARALLEL Concurrent source-address ping probes per batch. Default: 32; allowed: 1-128.
   VPN_VIP_PROBE_TARGET Ping target used for active VIP verification. Default: www.baidu.com.
+  VPN_PLATFORM_SCAN_CLEAN_STALE Remove stale /32 aliases in the primary private subnet before a platform scan. Default: 1.
   VPN_INGRESS_MODE    L2TP ingress mode: smart or bound. Default: smart.
                       smart = one xl2tpd listener plus DNAT for other local ingress IPs.
                       bound = one xl2tpd listener per local ingress IP.
@@ -693,7 +695,8 @@ expand_vip_scan_specs() {
 verify_platform_vip_candidates() {
   [ "${VPN_PLATFORM_SCAN:-0}" = "1" ] || return 0
   local raw item candidate probe_target verified="" temp_dir offset index batch_end
-  local -a candidate_parts=() scan_ips=() existed_flags=()
+  local primary_cidr primary_ip bounds subnet_start subnet_end cidr existing_ip existing_prefix existing_int
+  local -a candidate_parts=() scan_ips=()
   probe_target="${VPN_VIP_PROBE_TARGET:-www.baidu.com}"
   raw="${VPN_VIP_SCAN_RANGE:-${VPN_VIP_CANDIDATES:-}}"
 
@@ -701,6 +704,31 @@ verify_platform_vip_candidates() {
   VPN_VIPS=""
   [ -n "$raw" ] || { log "Platform VIP scan found no candidates."; return 0; }
   raw="$(expand_vip_scan_specs "$raw" "$VPN_VIP_SCAN_MAX")"
+
+  # A previous interrupted scan can leave temporary /32 addresses behind.  A
+  # platform scan owns these aliases, so remove stale ones in the primary
+  # private subnet before probing again.  The primary address itself is never
+  # touched.  This is deliberately limited to /32 aliases, not arbitrary NIC
+  # addresses, and can be disabled for unusual manual network layouts.
+  if [ "${VPN_PLATFORM_SCAN_CLEAN_STALE:-1}" = "1" ]; then
+    primary_cidr="${VPN_IFACE_IPV4S%% *}"
+    primary_ip="${primary_cidr%%/*}"
+    if is_ipv4_cidr "$primary_cidr"; then
+      bounds="$(cidr_bounds "$primary_cidr")"
+      subnet_start="${bounds%% *}"
+      subnet_end="${bounds#* }"
+      while IFS= read -r cidr; do
+        existing_ip="${cidr%%/*}"
+        existing_prefix="${cidr#*/}"
+        [ "$existing_ip" = "$primary_ip" ] && continue
+        [ "$existing_prefix" = "32" ] || continue
+        existing_int="$(ipv4_to_int "$existing_ip")"
+        [ "$existing_int" -ge "$subnet_start" ] && [ "$existing_int" -le "$subnet_end" ] || continue
+        ip addr del "$cidr" dev "$VPN_IFACE" || warn "Could not remove stale platform-scan alias $cidr from $VPN_IFACE."
+        log "Removed stale platform-scan alias $cidr from $VPN_IFACE."
+      done < <(ip -o -4 addr show dev "$VPN_IFACE" scope global | awk '{print $4}')
+    fi
+  fi
 
   IFS=',' read -r -a candidate_parts <<<"$raw"
   for item in "${candidate_parts[@]}"; do
@@ -713,12 +741,8 @@ verify_platform_vip_candidates() {
     if printf '%s\n' "${scan_ips[*]:-}" | grep -Fwq "$candidate"; then
       continue
     fi
-    if ip -o -4 addr show dev "$VPN_IFACE" | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$candidate"; then
+    if ip addr add "$candidate/32" dev "$VPN_IFACE"; then
       scan_ips+=("$candidate")
-      existed_flags+=("1")
-    elif ip addr add "$candidate/32" dev "$VPN_IFACE"; then
-      scan_ips+=("$candidate")
-      existed_flags+=("0")
     else
       warn "Could not temporarily add VIP candidate $candidate to $VPN_IFACE."
     fi
@@ -746,9 +770,7 @@ verify_platform_vip_candidates() {
       log "Verified platform VIP $candidate on $VPN_IFACE via $probe_target."
     else
       warn "VIP candidate $candidate failed the source-address ping to $probe_target."
-      if [ "${existed_flags[$index]}" = "0" ]; then
-        ip addr del "$candidate/32" dev "$VPN_IFACE" || warn "Could not remove failed temporary VIP $candidate."
-      fi
+      ip addr del "$candidate/32" dev "$VPN_IFACE" || warn "Could not remove failed temporary VIP $candidate."
     fi
   done
   rm -rf -- "$temp_dir"
@@ -2049,15 +2071,10 @@ vip_list_has_ip() {
 
 auto_config_from_users() {
   [ "${VPN_AUTO_CONFIG_FROM_USERS:-0}" = "1" ] || return 0
-  local i egress_ip client_scope has_dedicated=0 added_vips=0
+  local i egress_ip added_vips=0
 
   for i in "${!USER_NAMES[@]}"; do
     egress_ip="${USER_EGRESS_IPS[$i]:-}"
-    client_scope="${USER_CLIENT_IPS[$i]:-*}"
-
-    if [ -n "$client_scope" ] && [ "$client_scope" != "*" ]; then
-      has_dedicated=1
-    fi
 
     if [ -n "$egress_ip" ] && is_ipv4 "$egress_ip"; then
       if ! iface_has_ip "$egress_ip" && ! vip_list_has_ip "$egress_ip"; then
@@ -2068,18 +2085,29 @@ auto_config_from_users() {
     fi
   done
 
-  if [ "$has_dedicated" = "1" ] && [ "${VPN_CLIENT_POOL_MODE:-auto}" = "auto" ]; then
-    VPN_CLIENT_POOL_MODE="per_vip"
-    log "Detected dedicated client IP/pool in users.conf; using VPN_CLIENT_POOL_MODE=per_vip."
-  fi
-
-  if [ "$has_dedicated" = "1" ] && [ "${VPN_CLIENT_POOL_MODE:-auto}" = "per_vip" ] && [ "${VPN_INGRESS_MODE:-smart}" != "bound" ]; then
-    VPN_INGRESS_MODE="bound"
-    log "Detected dedicated client IP/pool in users.conf; using VPN_INGRESS_MODE=bound."
-  fi
-
   if [ "$added_vips" = "1" ]; then
     log "Added egress IPs from users.conf to VPN_VIPS: $VPN_VIPS"
+  fi
+}
+
+configure_dedicated_client_scopes() {
+  local i client_scope has_dedicated=0
+  for i in "${!USER_NAMES[@]}"; do
+    client_scope="${USER_CLIENT_IPS[$i]:-*}"
+    if [ -n "$client_scope" ] && [ "$client_scope" != "*" ]; then
+      has_dedicated=1
+      break
+    fi
+  done
+  [ "$has_dedicated" = "1" ] || return 0
+
+  if [ "${VPN_CLIENT_POOL_MODE:-auto}" = "auto" ]; then
+    VPN_CLIENT_POOL_MODE="per_vip"
+    log "Detected dedicated client IP/pool; using VPN_CLIENT_POOL_MODE=per_vip."
+  fi
+  if [ "${VPN_CLIENT_POOL_MODE:-auto}" = "per_vip" ] && [ "${VPN_INGRESS_MODE:-smart}" != "bound" ]; then
+    VPN_INGRESS_MODE="bound"
+    log "Detected dedicated client IP/pool; using VPN_INGRESS_MODE=bound."
   fi
 }
 
@@ -2175,7 +2203,11 @@ dedicated_client_scope_for_bind_ip() {
   chosen_scope=""
   user_list=""
   for i in "${!USER_NAMES[@]}"; do
-    [ "${USER_EGRESS_IPS[$i]:-}" = "$bind_ip" ] || continue
+    if [ "${USER_EGRESS_IPS[$i]:-}" != "$bind_ip" ]; then
+      # A server with one listener has an unambiguous ingress address, so a
+      # single-user deployment may omit column 3 and still use a fixed pool.
+      [ -z "${USER_EGRESS_IPS[$i]:-}" ] && [ "${#L2TP_BIND_IPS[@]}" -eq 1 ] || continue
+    fi
     scope="${USER_CLIENT_IPS[$i]:-*}"
     [ -n "$scope" ] && [ "$scope" != "*" ] || continue
     if [ -n "$chosen_scope" ] && [ "$chosen_scope" != "$scope" ]; then
@@ -2192,13 +2224,17 @@ dedicated_client_scope_for_bind_ip() {
 }
 
 validate_dedicated_scope_ingress_mode() {
-  local i scope
+  local i scope egress_ip
   [ "${VPN_CLIENT_POOL_MODE:-auto}" != "global" ] || return 0
   for i in "${!USER_NAMES[@]}"; do
     scope="${USER_CLIENT_IPS[$i]:-*}"
     [ -n "$scope" ] && [ "$scope" != "*" ] || continue
     if [ "${VPN_INGRESS_MODE:-smart}" != "bound" ]; then
       fail "User '${USER_NAMES[$i]}' uses dedicated vpn_ip '$scope'. Set VPN_INGRESS_MODE=bound and connect this user to the public EIP mapped to ${USER_EGRESS_IPS[$i]:-its local VIP}, or leave column 5 empty for the global pool."
+    fi
+    egress_ip="${USER_EGRESS_IPS[$i]:-}"
+    if [ -z "$egress_ip" ] && [ "${#L2TP_BIND_IPS[@]}" -gt 1 ]; then
+      fail "User '${USER_NAMES[$i]}' uses dedicated vpn_ip '$scope' but has no egress_local_vip in column 3. With multiple public IPs, set column 3 to the matching local VIP so the correct client pool can be selected."
     fi
   done
 }
@@ -3193,6 +3229,7 @@ main() {
   VPN_VIP_SCAN_MAX="${VPN_VIP_SCAN_MAX:-512}"
   VPN_VIP_SCAN_PARALLEL="${VPN_VIP_SCAN_PARALLEL:-32}"
   VPN_VIP_PROBE_TARGET="${VPN_VIP_PROBE_TARGET:-www.baidu.com}"
+  VPN_PLATFORM_SCAN_CLEAN_STALE="${VPN_PLATFORM_SCAN_CLEAN_STALE:-1}"
   VPN_INGRESS_MODE="${VPN_INGRESS_MODE:-smart}"
   VPN_CLIENT_POOL_MODE="${VPN_CLIENT_POOL_MODE:-auto}"
   VPN_AUTO_CONFIG_FROM_USERS="${VPN_AUTO_CONFIG_FROM_USERS:-0}"
@@ -3219,6 +3256,10 @@ main() {
     0|1) ;;
     *) fail "VPN_AUTO_CONFIG_FROM_USERS must be 0 or 1." ;;
   esac
+  case "$VPN_PLATFORM_SCAN_CLEAN_STALE" in
+    0|1) ;;
+    *) fail "VPN_PLATFORM_SCAN_CLEAN_STALE must be 0 or 1." ;;
+  esac
   validate_number_between VPN_VIP_SCAN_MAX "$VPN_VIP_SCAN_MAX" 1 4096
   validate_number_between VPN_VIP_SCAN_PARALLEL "$VPN_VIP_SCAN_PARALLEL" 1 128
   is_ipv4 "$VPN_LOCAL_IP" || fail "Invalid VPN_LOCAL_IP '$VPN_LOCAL_IP'."
@@ -3238,6 +3279,7 @@ main() {
   VPN_IFACE="${VPN_IFACE:-$(detect_iface)}"
   VPN_IFACE_IPV4S="$(detect_iface_ipv4s "$VPN_IFACE" "$VPN_PRIMARY_IP")"
   verify_platform_vip_candidates
+  configure_dedicated_client_scopes
   auto_config_from_users
   resolve_ingress_ip
   VPN_INGRESS_IP="$L2TP_INGRESS_IP"
