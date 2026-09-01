@@ -1274,12 +1274,63 @@ install_ctyunos_packages() {
 
   "$pm" clean all >/dev/null 2>&1 || true
   "$pm" makecache -y
-  "$pm" install -y ca-certificates curl iproute iptables openssl sed ppp xl2tpd ||
-    fail "Could not install CTyunOS L2TP packages from the configured vendor repositories. Do not add CentOS/EPEL repositories; run '$pm provides '*/xl2tpd'' and ensure the CTyunOS repository containing xl2tpd is enabled."
+  "$pm" install -y ca-certificates curl iproute iptables openssl sed ppp
+  if ! command -v xl2tpd >/dev/null 2>&1; then
+    if ! "$pm" install -y xl2tpd; then
+      log "CTyunOS repositories do not provide xl2tpd; building the pinned upstream release instead."
+      install_ctyunos_xl2tpd_from_source "$pm"
+    fi
+  fi
   if [ "$VPN_ENABLE_IPSEC" = "1" ]; then
     "$pm" install -y strongswan ||
       fail "Could not install strongswan from the configured CTyunOS repositories. Enable the CTyunOS repository that provides it, then rerun the installer."
   fi
+}
+
+install_ctyunos_xl2tpd_from_source() {
+  local pm="$1" version="1.3.20" source_dir build_dir
+  "$pm" install -y gcc make tar gzip libpcap-devel ||
+    fail "CTyunOS does not provide xl2tpd and its build dependencies could not be installed. Enable the CTyunOS repository containing gcc, make, and libpcap-devel, then rerun the installer."
+
+  source_dir="$(mktemp -d)"
+  build_dir="$source_dir/xl2tpd-$version"
+  curl -fsSL "https://github.com/xelerance/xl2tpd/archive/refs/tags/v$version.tar.gz" -o "$source_dir/xl2tpd.tar.gz" || {
+    rm -rf -- "$source_dir"
+    fail "Could not download xl2tpd v$version source from its official upstream repository."
+  }
+  tar -xzf "$source_dir/xl2tpd.tar.gz" -C "$source_dir" || {
+    rm -rf -- "$source_dir"
+    fail "Could not extract the xl2tpd v$version source archive."
+  }
+  [ -d "$build_dir" ] || {
+    rm -rf -- "$source_dir"
+    fail "The xl2tpd source archive had an unexpected directory layout."
+  }
+  if ! make -C "$build_dir" || ! make -C "$build_dir" install; then
+    rm -rf -- "$source_dir"
+    fail "Could not build/install xl2tpd v$version on CTyunOS."
+  fi
+  rm -rf -- "$source_dir"
+
+  cat >/etc/systemd/system/xl2tpd.service <<'EOF'
+[Unit]
+Description=xl2tpd L2TP daemon (upstream source build)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/xl2tpd -D -l -c /etc/xl2tpd/xl2tpd.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable xl2tpd.service >/dev/null
+  log "Installed xl2tpd v$version from official upstream source for CTyunOS."
 }
 
 install_packages() {
