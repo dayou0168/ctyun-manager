@@ -60,7 +60,7 @@ usage() {
 Usage:
   sudo bash $SCRIPT_NAME
 
-One-click L2TP server installer for Debian 9+, Ubuntu 18.04+, and CentOS 7/8/Stream 9.
+One-click L2TP server installer for Debian 9+, Ubuntu 18.04+, CentOS 7/8/Stream 9, and CTyunOS V4.0.
 Default mode is L2TP username/password only, without IPsec/PSK.
 
 Common environment variables:
@@ -123,6 +123,7 @@ Network variables:
 
 Package source variables:
   VPN_CONFIGURE_TUNA_MIRROR Switch supported system repositories to Tsinghua TUNA before installing. Default: 1.
+                            CTyunOS keeps its vendor-provided repositories because CentOS/EPEL/TUNA repos are incompatible.
   VPN_TUNA_MIRROR      Mirror root. Default: http://mirrors.tuna.tsinghua.edu.cn.
   VPN_APT_FORCE_IPV4   Force apt to use IPv4 and disable HTTP pipelining. Default: 1.
 
@@ -791,12 +792,12 @@ detect_system() {
 
   case "$OS_ID" in
     debian|ubuntu) OS_FAMILY="apt" ;;
-    centos) OS_FAMILY="rhel" ;;
+    centos|ctyunos|ctyun-os) OS_FAMILY="rhel" ;;
     *)
       case " $OS_ID_LIKE " in
         *" debian "*) OS_FAMILY="apt" ;;
         *" centos "*) OS_FAMILY="rhel" ;;
-        *) fail "Unsupported Linux distribution '$OS_ID'. Supported: Debian, Ubuntu, and CentOS 7/8/Stream 9." ;;
+        *) fail "Unsupported Linux distribution '$OS_ID'. Supported: Debian, Ubuntu, CentOS 7/8/Stream 9, and CTyunOS V4.0." ;;
       esac
       ;;
   esac
@@ -810,6 +811,12 @@ detect_system() {
       ;;
     centos)
       case "${OS_VERSION_ID%%.*}" in 7|8|9) ;; *) fail "Supported CentOS versions: 7, 8, and Stream 9." ;; esac
+      ;;
+    ctyunos|ctyun-os)
+      case "$OS_VERSION_ID" in
+        4|4.*) ;;
+        *) fail "Supported CTyunOS version: V4.0. Detected: ${OS_VERSION_ID:-unknown}." ;;
+      esac
       ;;
   esac
   log "Detected system: ${PRETTY_NAME:-$OS_ID $OS_VERSION_ID} ($OS_ARCH)."
@@ -1146,6 +1153,12 @@ configure_package_sources() {
     log "Keeping existing package repositories."
     return 0
   fi
+  case "$OS_ID" in
+    ctyunos|ctyun-os)
+      log "CTyunOS detected: keeping vendor-provided DNF/YUM repositories. CentOS, EPEL, and TUNA repository definitions are not applied."
+      return 0
+      ;;
+  esac
   case "$OS_FAMILY" in
     apt) configure_apt_tuna_mirror ;;
     rhel) configure_rhel_tuna_mirror ;;
@@ -1254,6 +1267,21 @@ install_rhel_packages() {
   "$pm" install -y "${packages[@]}"
 }
 
+install_ctyunos_packages() {
+  local pm
+  pm="$(command -v dnf || command -v yum || true)"
+  [ -n "$pm" ] || fail "CTyunOS requires dnf or yum, but neither command was found."
+
+  "$pm" clean all >/dev/null 2>&1 || true
+  "$pm" makecache -y
+  "$pm" install -y ca-certificates curl iproute iptables openssl sed ppp xl2tpd ||
+    fail "Could not install CTyunOS L2TP packages from the configured vendor repositories. Do not add CentOS/EPEL repositories; run '$pm provides '*/xl2tpd'' and ensure the CTyunOS repository containing xl2tpd is enabled."
+  if [ "$VPN_ENABLE_IPSEC" = "1" ]; then
+    "$pm" install -y strongswan ||
+      fail "Could not install strongswan from the configured CTyunOS repositories. Enable the CTyunOS repository that provides it, then rerun the installer."
+  fi
+}
+
 install_packages() {
   detect_system
   configure_package_sources
@@ -1266,6 +1294,12 @@ install_packages() {
 
   if [ "$OS_FAMILY" = "rhel" ] && { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; }; then
     log "Installing packages with dnf/yum..."
+    case "$OS_ID" in
+      ctyunos|ctyun-os)
+        install_ctyunos_packages
+        return 0
+        ;;
+    esac
     install_rhel_packages
     return 0
   fi
