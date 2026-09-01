@@ -2045,7 +2045,12 @@ EOF
 
 configure_sysctl() {
   log "Configuring kernel forwarding..."
-  cat >/etc/sysctl.d/99-l2tp-vpn.conf <<EOF
+  # CTyunOS ships /etc/sysctl.d/99-sysctl.conf with ip_forward=0.  Use a
+  # lexically later drop-in so systemd-sysctl keeps the VPN settings after a
+  # reboot, then apply this exact file last because `sysctl --system` also
+  # processes /etc/sysctl.conf after the drop-in directories.
+  rm -f /etc/sysctl.d/99-l2tp-vpn.conf
+  cat >/etc/sysctl.d/zz-l2tp-vpn.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -2053,6 +2058,8 @@ net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 EOF
   sysctl --system >/dev/null
+  sysctl -p /etc/sysctl.d/zz-l2tp-vpn.conf >/dev/null
+  [ "$(sysctl -n net.ipv4.ip_forward)" = "1" ] || fail "Could not enable net.ipv4.ip_forward. Check for a system policy that overwrites sysctl settings."
 }
 
 configure_ipsec() {
@@ -2368,6 +2375,11 @@ set -euo pipefail
 
 CONFIG_DIR=$(shell_quote "$XL2TPD_MULTI_CONFIG_DIR")
 RUN_DIR=$(shell_quote "$XL2TPD_MULTI_RUN_DIR")
+XL2TPD_BIN="\$(command -v xl2tpd || true)"
+[ -n "\$XL2TPD_BIN" ] && [ -x "\$XL2TPD_BIN" ] || {
+  echo "xl2tpd executable was not found in PATH." >&2
+  exit 1
+}
 
 stop_instances() {
   local pid_file pid
@@ -2390,7 +2402,7 @@ start_instances() {
     safe="\$(basename "\$config" .conf)"
     pid_file="\$RUN_DIR/\$safe.pid"
     control_file="\$RUN_DIR/\$safe.control"
-    /usr/sbin/xl2tpd -c "\$config" -p "\$pid_file" -C "\$control_file"
+    "\$XL2TPD_BIN" -c "\$config" -p "\$pid_file" -C "\$control_file"
   done
 }
 
