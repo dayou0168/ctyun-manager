@@ -4,6 +4,7 @@ set -euo pipefail
 SOURCE_DIR="${CTYUN_MANAGER_SOURCE_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 INSTALL_DIR="${CTYUN_MANAGER_INSTALL_DIR:-/opt/ctyun-manager}"
 SERVICE_NAME="${CTYUN_MANAGER_SERVICE_NAME:-ctyun-manager}"
+CONTAINER_NAME="${CTYUN_MANAGER_CONTAINER_NAME:-ctyun-manager}"
 PORT="${CTYUN_MANAGER_PORT:-8000}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RELEASE_ROOT="$INSTALL_DIR/.go-releases"
@@ -12,6 +13,9 @@ BACKUP_DIR="$INSTALL_DIR/backups/go-migration-$STAMP"
 IMAGE="ctyun-manager:go-$STAMP"
 OLD_SERVICE_ACTIVE=0
 OLD_SERVICE_ENABLED=0
+OLD_CONTAINER_ID=""
+OLD_CONTAINER_RUNNING=0
+ROLLBACK_CONTAINER="$CONTAINER_NAME-rollback-$STAMP"
 BUILD_FILE="Dockerfile"
 
 fail() { echo "[upgrade] ERROR: $*" >&2; exit 1; }
@@ -61,12 +65,20 @@ docker build --pull -f "$RELEASE_DIR/$BUILD_FILE" --build-arg VERSION="$STAMP" -
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then OLD_SERVICE_ACTIVE=1; fi
 if systemctl is-enabled --quiet "$SERVICE_NAME"; then OLD_SERVICE_ENABLED=1; fi
+OLD_CONTAINER_ID="$(docker ps -aq --filter "name=^/${CONTAINER_NAME}$" | head -n 1)"
+if [ -n "$OLD_CONTAINER_ID" ] && [ "$(docker inspect -f '{{.State.Running}}' "$OLD_CONTAINER_ID")" = "true" ]; then
+  OLD_CONTAINER_RUNNING=1
+fi
 rollback() {
   code=$?
   trap - EXIT
   if [ "$code" -ne 0 ]; then
     echo "[upgrade] New service failed; rolling back."
     (cd "$RELEASE_DIR" && CTYUN_MANAGER_IMAGE="$IMAGE" CTYUN_MANAGER_DATA_DIR="$INSTALL_DIR/data" "${COMPOSE[@]}" -f docker-compose.deploy.yml down) >/dev/null 2>&1 || true
+    if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+      docker rename "$ROLLBACK_CONTAINER" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      if [ "$OLD_CONTAINER_RUNNING" -eq 1 ]; then docker start "$CONTAINER_NAME" >/dev/null 2>&1 || true; fi
+    fi
     if [ "$OLD_SERVICE_ENABLED" -eq 1 ]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
     if [ "$OLD_SERVICE_ACTIVE" -eq 1 ]; then systemctl start "$SERVICE_NAME" || true; fi
     echo "[upgrade] Backup retained at $BACKUP_DIR"
@@ -82,6 +94,12 @@ sqlite3 "$DB" ".timeout 30000" ".backup '$BACKUP_DIR/ctyun-manager.db'"
 sqlite3 "$BACKUP_DIR/ctyun-manager.db" "pragma integrity_check" | grep -qx ok || fail "backup integrity check failed"
 for file in "$INSTALL_DIR/data/master.key" "$INSTALL_DIR/.env"; do [ ! -f "$file" ] || cp -a "$file" "$BACKUP_DIR/"; done
 
+if [ -n "$OLD_CONTAINER_ID" ]; then
+  echo "[upgrade] Preserving the current container as $ROLLBACK_CONTAINER during cutover..."
+  docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker rename "$CONTAINER_NAME" "$ROLLBACK_CONTAINER"
+fi
+
 echo "[upgrade] Starting Go + Node.js release..."
 (cd "$RELEASE_DIR" && CTYUN_MANAGER_IMAGE="$IMAGE" CTYUN_MANAGER_DATA_DIR="$INSTALL_DIR/data" "${COMPOSE[@]}" -f docker-compose.deploy.yml up -d --remove-orphans)
 
@@ -95,6 +113,9 @@ curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/version" | grep -q '"migratio
 
 if [ "$OLD_SERVICE_ENABLED" -eq 1 ]; then
   systemctl disable "$SERVICE_NAME" >/dev/null
+fi
+if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+  docker rm "$ROLLBACK_CONTAINER" >/dev/null
 fi
 
 ln -sfn "$RELEASE_DIR" "$RELEASE_ROOT/current"
