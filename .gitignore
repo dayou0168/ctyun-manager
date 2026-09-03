@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .venv/
+node_modules/
 .playwright/
 __pycache__/
 *.pyc
@@ -16,6 +17,10 @@ work-*.out.log
 work-*.err.log
 work-*.pid
 *.pid
+bin/
+dist/
+coverage.out
 ctyun-manager.zip
 ctyun-manager-deploy-*.zip
 *.zip
+*.tar.gz

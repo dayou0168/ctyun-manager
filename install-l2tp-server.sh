@@ -53,6 +53,8 @@ SERVER_CONFIG_VARS=(
   VPN_ENABLE_BBR
   VPN_DISABLE_DEFAULT_MASQ
   VPN_ADD_EGRESS_AS_VIP
+  VPN_XL2TPD_SOURCE_URL
+  VPN_XL2TPD_SOURCE_SHA256
 )
 
 usage() {
@@ -126,6 +128,8 @@ Package source variables:
                             CTyunOS keeps its vendor-provided repositories because CentOS/EPEL/TUNA repos are incompatible.
   VPN_TUNA_MIRROR      Mirror root. Default: http://mirrors.tuna.tsinghua.edu.cn.
   VPN_APT_FORCE_IPV4   Force apt to use IPv4 and disable HTTP pipelining. Default: 1.
+  VPN_XL2TPD_SOURCE_URL Override the pinned official xl2tpd source archive URL used when CTyunOS has no package.
+  VPN_XL2TPD_SOURCE_SHA256 SHA-256 for an overridden source archive. Required when the URL is changed.
 
 Tianyi Cloud VIP/EIP example:
   sudo VPN_USERS='acct1:pass1:172.16.0.11:2::61.1.1.1,acct2:pass2:172.16.0.12:3::61.1.1.2' \\
@@ -1275,8 +1279,13 @@ install_ctyunos_packages() {
   "$pm" clean all >/dev/null 2>&1 || true
   "$pm" makecache -y
   "$pm" install -y ca-certificates curl iproute iptables openssl sed ppp
+  command -v pppd >/dev/null 2>&1 ||
+    fail "The CTyunOS ppp package was installed but pppd is not available in PATH. Enable the vendor repository that provides a complete ppp package, then rerun the installer."
   if ! command -v xl2tpd >/dev/null 2>&1; then
-    if ! "$pm" install -y xl2tpd; then
+    if "$pm" install -y xl2tpd; then
+      log "Installed xl2tpd from the CTyunOS vendor repository."
+    fi
+    if ! command -v xl2tpd >/dev/null 2>&1; then
       log "CTyunOS repositories do not provide xl2tpd; building the pinned upstream release instead."
       install_ctyunos_xl2tpd_from_source "$pm"
     fi
@@ -1288,16 +1297,35 @@ install_ctyunos_packages() {
 }
 
 install_ctyunos_xl2tpd_from_source() {
-  local pm="$1" version="1.3.20" source_dir build_dir
-  "$pm" install -y gcc make tar gzip libpcap-devel ||
-    fail "CTyunOS does not provide xl2tpd and its build dependencies could not be installed. Enable the CTyunOS repository containing gcc, make, and libpcap-devel, then rerun the installer."
+  local pm="$1" version="1.3.20" default_url source_url expected_sha source_dir build_dir jobs binary
+  default_url="https://github.com/xelerance/xl2tpd/archive/refs/tags/v$version.tar.gz"
+  source_url="${VPN_XL2TPD_SOURCE_URL:-$default_url}"
+  expected_sha="${VPN_XL2TPD_SOURCE_SHA256:-3db95450c5e1efaeea7547af344b5621f4453af3c227f26ec43bcbc79087b045}"
+  if [ "$source_url" != "$default_url" ] && [ -z "${VPN_XL2TPD_SOURCE_SHA256:-}" ]; then
+    fail "VPN_XL2TPD_SOURCE_SHA256 is required when VPN_XL2TPD_SOURCE_URL overrides the pinned official archive."
+  fi
+
+  case "$OS_ARCH" in
+    aarch64|arm64|armv7l|armv8l|x86_64|amd64) ;;
+    *) fail "CTyunOS source installation does not support architecture '$OS_ARCH'. Supported: aarch64/arm64, armv7l/armv8l, and x86_64/amd64." ;;
+  esac
+
+  # Only the daemon and control utility are required. Building the optional pfc
+  # utility pulls in libpcap-devel, which is absent from several CTyunOS V4 ARM
+  # repositories and previously made an otherwise portable xl2tpd build fail.
+  "$pm" install -y gcc make tar gzip coreutils ||
+    fail "CTyunOS does not provide xl2tpd and its build dependencies could not be installed. Enable the CTyunOS vendor repository containing gcc, make, tar, gzip, and coreutils, then rerun the installer."
 
   source_dir="$(mktemp -d)"
   build_dir="$source_dir/xl2tpd-$version"
-  curl -fsSL "https://github.com/xelerance/xl2tpd/archive/refs/tags/v$version.tar.gz" -o "$source_dir/xl2tpd.tar.gz" || {
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 "$source_url" -o "$source_dir/xl2tpd.tar.gz" || {
     rm -rf -- "$source_dir"
     fail "Could not download xl2tpd v$version source from its official upstream repository."
   }
+  if ! printf '%s  %s\n' "$expected_sha" "$source_dir/xl2tpd.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+    rm -rf -- "$source_dir"
+    fail "The downloaded xl2tpd v$version source archive failed SHA-256 verification."
+  fi
   tar -xzf "$source_dir/xl2tpd.tar.gz" -C "$source_dir" || {
     rm -rf -- "$source_dir"
     fail "Could not extract the xl2tpd v$version source archive."
@@ -1306,11 +1334,23 @@ install_ctyunos_xl2tpd_from_source() {
     rm -rf -- "$source_dir"
     fail "The xl2tpd source archive had an unexpected directory layout."
   }
-  if ! make -C "$build_dir" || ! make -C "$build_dir" install; then
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+  case "$jobs" in ''|*[!0-9]*) jobs=1 ;; esac
+  [ "$jobs" -le 2 ] || jobs=2
+  if ! make -C "$build_dir" -j "$jobs" xl2tpd xl2tpd-control; then
     rm -rf -- "$source_dir"
-    fail "Could not build/install xl2tpd v$version on CTyunOS."
+    fail "Could not build xl2tpd v$version on CTyunOS $OS_ARCH."
   fi
+  install -d -m 0755 /usr/local/sbin
+  install -m 0755 "$build_dir/xl2tpd" /usr/local/sbin/xl2tpd
+  install -m 0755 "$build_dir/xl2tpd-control" /usr/local/sbin/xl2tpd-control
   rm -rf -- "$source_dir"
+
+  binary="/usr/local/sbin/xl2tpd"
+  [ -x "$binary" ] || fail "xl2tpd was built but the installed executable was not found."
+  if command -v ldd >/dev/null 2>&1 && ldd "$binary" 2>&1 | grep -q 'not found'; then
+    fail "xl2tpd was built but has unresolved shared-library dependencies on CTyunOS $OS_ARCH."
+  fi
 
   cat >/etc/systemd/system/xl2tpd.service <<'EOF'
 [Unit]
@@ -1330,7 +1370,7 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable xl2tpd.service >/dev/null
-  log "Installed xl2tpd v$version from official upstream source for CTyunOS."
+  log "Installed verified xl2tpd v$version from official upstream source for CTyunOS $OS_ARCH."
 }
 
 install_packages() {

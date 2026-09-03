@@ -1,0 +1,24 @@
+FROM mcr.microsoft.com/playwright:v1.55.1-noble
+ENV NODE_ENV=production CTYUN_MANAGER_ROOT=/app CTYUN_MANAGER_DB=/app/data/ctyun-manager.db \
+    CTYUN_MANAGER_GO_HOST=0.0.0.0 CTYUN_MANAGER_GO_PORT=8000 CTYUN_MANAGER_DB_READ_ONLY=0 \
+    CTYUN_BROWSER_WORKER_URL=http://127.0.0.1:18080 CTYUN_BROWSER_WORKER_PORT=18080 \
+    CTYUN_BROWSER_HEADLESS=1 HOME=/app/data/home
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tini fonts-noto-cjk && rm -rf /var/lib/apt/lists/*
+COPY ctyun-manager-linux /app/ctyun-manager
+COPY app/static /app/app/static
+COPY install-l2tp-server.sh /app/install-l2tp-server.sh
+COPY worker/package.json worker/pnpm-lock.yaml worker/server.mjs worker/recharge.mjs /app/worker/
+RUN npm install --global pnpm@10.15.1 --no-audit --no-fund \
+    && cd /app/worker && pnpm install --prod --frozen-lockfile \
+    && mkdir -p /app/data/home \
+    && groupadd --system --gid 10001 ctyun-manager \
+    && useradd --system --uid 10001 --gid 10001 --home-dir /app/data/home --shell /usr/sbin/nologin ctyun-manager \
+    && chown -R ctyun-manager:ctyun-manager /app/data /app/worker \
+    && chmod 755 /app/ctyun-manager /app/install-l2tp-server.sh
+COPY start-go.sh /app/start-go.sh
+RUN chmod 755 /app/start-go.sh
+USER ctyun-manager
+EXPOSE 8000
+ENTRYPOINT ["/usr/bin/tini","--"]
+CMD ["/app/start-go.sh"]

@@ -1,0 +1,8 @@
+{
+  "name": "ctyun-manager-browser-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {"start": "node server.mjs", "check": "node --check server.mjs && node --check recharge.mjs", "test": "node --test"},
+  "dependencies": {"playwright": "1.55.1", "qrcode": "1.5.4"}
+}

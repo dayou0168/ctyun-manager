@@ -26,7 +26,11 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl tar
+apt-get install -y --no-install-recommends ca-certificates curl tar sqlite3
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get install -y --no-install-recommends docker.io docker-compose
+  systemctl enable --now docker
+fi
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -53,28 +57,15 @@ fi
 
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 SRC_DIR="$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-if [ -z "$SRC_DIR" ] || [ ! -f "$SRC_DIR/install.sh" ]; then
+if [ -z "$SRC_DIR" ] || [ ! -f "$SRC_DIR/upgrade-go-docker.sh" ]; then
   echo "Downloaded archive does not look like a ctyun-manager release."
   exit 1
 fi
 
-systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-
 mkdir -p "$INSTALL_DIR"
-for item in "$INSTALL_DIR"/* "$INSTALL_DIR"/.[!.]* "$INSTALL_DIR"/..?*; do
-  [ -e "$item" ] || continue
-  base="$(basename "$item")"
-  case "$base" in
-    .env|data|.playwright|.venv|master.key|*.db|*.db-shm|*.db-wal|*.log|work-*.out.log|work-*.err.log)
-      continue
-      ;;
-  esac
-  rm -rf "$item"
-done
-
-cp -a "$SRC_DIR"/. "$INSTALL_DIR"/
-chmod +x "$INSTALL_DIR"/*.sh
-
-cd "$INSTALL_DIR"
-echo "Running local installer in $INSTALL_DIR..."
-./install.sh
+chmod +x "$SRC_DIR/upgrade-go-docker.sh"
+echo "Running backup-first Go/Node Docker upgrader..."
+CTYUN_MANAGER_SOURCE_DIR="$SRC_DIR" \
+CTYUN_MANAGER_INSTALL_DIR="$INSTALL_DIR" \
+CTYUN_MANAGER_SERVICE_NAME="$SERVICE_NAME" \
+  "$SRC_DIR/upgrade-go-docker.sh"

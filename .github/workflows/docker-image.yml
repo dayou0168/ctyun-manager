@@ -4,12 +4,23 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
     paths:
       - ".github/workflows/docker-image.yml"
       - "Dockerfile"
-      - "requirements.txt"
-      - "start.sh"
-      - "app/**"
+      - "Dockerfile.prebuilt"
+      - "docker-compose.deploy.yml"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "worker/**"
+      - "start-go.sh"
+      - "install-linux.sh"
+      - "upgrade-go-docker.sh"
+      - "install-l2tp-server.sh"
+      - "tests/**"
   workflow_dispatch:
 
 permissions:
@@ -17,7 +28,67 @@ permissions:
   packages: write
 
 jobs:
+  l2tp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install ARM64 cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Check installer shell syntax
+        run: bash -n install-l2tp-server.sh tests/verify-xl2tpd-source-build.sh
+      - name: Compile pinned xl2tpd for ARM64
+        env:
+          CC: aarch64-linux-gnu-gcc
+          EXPECTED_FILE_PATTERN: "ARM aarch64"
+        run: bash tests/verify-xl2tpd-source-build.sh
+
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build Linux binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath ./cmd/ctyun-manager-go
+          go build -trimpath ./cmd/api-compare
+
+  node-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: worker/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test worker
+        run: pnpm test
+
   publish:
+    needs: [go-test, node-test, l2tp-test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -38,8 +109,10 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
