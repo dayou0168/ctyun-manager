@@ -130,6 +130,7 @@ Package source variables:
   VPN_APT_FORCE_IPV4   Force apt to use IPv4 and disable HTTP pipelining. Default: 1.
   VPN_XL2TPD_SOURCE_URL Override the pinned official xl2tpd source archive URL used when CTyunOS has no package.
   VPN_XL2TPD_SOURCE_SHA256 SHA-256 for an overridden source archive. Required when the URL is changed.
+  VPN_XL2TPD_SOURCE_FILE Use a local xl2tpd source archive instead of downloading it. The platform sets this automatically.
 
 Tianyi Cloud VIP/EIP example:
   sudo VPN_USERS='acct1:pass1:172.16.0.11:2::61.1.1.1,acct2:pass2:172.16.0.12:3::61.1.1.2' \\
@@ -1297,11 +1298,13 @@ install_ctyunos_packages() {
 }
 
 install_ctyunos_xl2tpd_from_source() {
-  local pm="$1" version="1.3.20" default_url source_url expected_sha source_dir build_dir jobs binary
+  local pm="$1" version="1.3.20" default_url codeload_url source_url source_file expected_sha source_dir build_dir jobs binary
   default_url="https://github.com/xelerance/xl2tpd/archive/refs/tags/v$version.tar.gz"
+  codeload_url="https://codeload.github.com/xelerance/xl2tpd/tar.gz/refs/tags/v$version"
   source_url="${VPN_XL2TPD_SOURCE_URL:-$default_url}"
+  source_file="${VPN_XL2TPD_SOURCE_FILE:-}"
   expected_sha="${VPN_XL2TPD_SOURCE_SHA256:-3db95450c5e1efaeea7547af344b5621f4453af3c227f26ec43bcbc79087b045}"
-  if [ "$source_url" != "$default_url" ] && [ -z "${VPN_XL2TPD_SOURCE_SHA256:-}" ]; then
+  if [ -z "$source_file" ] && [ "$source_url" != "$default_url" ] && [ -z "${VPN_XL2TPD_SOURCE_SHA256:-}" ]; then
     fail "VPN_XL2TPD_SOURCE_SHA256 is required when VPN_XL2TPD_SOURCE_URL overrides the pinned official archive."
   fi
 
@@ -1318,10 +1321,28 @@ install_ctyunos_xl2tpd_from_source() {
 
   source_dir="$(mktemp -d)"
   build_dir="$source_dir/xl2tpd-$version"
-  curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 "$source_url" -o "$source_dir/xl2tpd.tar.gz" || {
-    rm -rf -- "$source_dir"
-    fail "Could not download xl2tpd v$version source from its official upstream repository."
-  }
+  if [ -n "$source_file" ]; then
+    [ -f "$source_file" ] || {
+      rm -rf -- "$source_dir"
+      fail "The supplied xl2tpd source archive does not exist: $source_file"
+    }
+    cp -- "$source_file" "$source_dir/xl2tpd.tar.gz" || {
+      rm -rf -- "$source_dir"
+      fail "Could not copy the supplied xl2tpd source archive."
+    }
+    log "Using the xl2tpd v$version source archive uploaded by the management platform."
+  elif ! curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 "$source_url" -o "$source_dir/xl2tpd.tar.gz"; then
+    if [ "$source_url" = "$default_url" ]; then
+      log "The GitHub archive endpoint is unavailable; trying the official codeload endpoint."
+      curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 "$codeload_url" -o "$source_dir/xl2tpd.tar.gz" || {
+        rm -rf -- "$source_dir"
+        fail "Could not obtain xl2tpd v$version source. Use the platform install button, which uploads the verified archive without requiring target-server GitHub access."
+      }
+    else
+      rm -rf -- "$source_dir"
+      fail "Could not download xl2tpd v$version source from the configured URL."
+    fi
+  fi
   if ! printf '%s  %s\n' "$expected_sha" "$source_dir/xl2tpd.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
     rm -rf -- "$source_dir"
     fail "The downloaded xl2tpd v$version source archive failed SHA-256 verification."

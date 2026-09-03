@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 )
 
 const l2tpUsersPath = "/etc/l2tp-vpn/users.conf"
+const xl2tpdSourceArchive = "xl2tpd-v1.3.20.tar.gz"
 
 type linuxStore interface {
 	LinuxServers(context.Context) ([]storage.LinuxServer, error)
@@ -369,6 +371,12 @@ func (s *Server) linuxL2TPInstall(w http.ResponseWriter, r *http.Request, _ secu
 		writeDetail(w, 500, "install-l2tp-server.sh not found")
 		return
 	}
+	sourceArchivePath := filepath.Join(filepath.Dir(s.cfg.L2TPScriptPath), "third_party", xl2tpdSourceArchive)
+	sourceArchive, err := os.ReadFile(sourceArchivePath)
+	if err != nil {
+		writeDetail(w, 500, "bundled xl2tpd source archive not found")
+		return
+	}
 	store, row, cfg, ok := s.linuxConnection(w, r)
 	if !ok {
 		return
@@ -382,6 +390,12 @@ func (s *Server) linuxL2TPInstall(w http.ResponseWriter, r *http.Request, _ secu
 	defer conn.Close()
 	tmp := "/tmp/ctyun-install-l2tp-" + uuid.NewString() + ".sh"
 	if _, err = conn.Write(tmp, string(script), 0700); err == nil {
+		sourceTmp := "/tmp/ctyun-xl2tpd-" + uuid.NewString() + ".tar.gz"
+		if _, err = conn.Write(sourceTmp, string(sourceArchive), 0600); err != nil {
+			s.linuxFailed(r, store, row, err)
+			writeDetail(w, 502, err.Error())
+			return
+		}
 		usersTmp := ""
 		if body.UsersConfig != "" {
 			usersTmp = "/tmp/ctyun-l2tp-users-" + uuid.NewString() + ".conf"
@@ -398,13 +412,14 @@ func (s *Server) linuxL2TPInstall(w http.ResponseWriter, r *http.Request, _ secu
 			ipsec = "VPN_ENABLE_IPSEC=1 VPN_IPSEC_PSK=" + shellQuote(body.PSK)
 		}
 		env := l2tpInstallEnv(body.Port, body.MTU, body.MRU, body.LocalIP, body.ClientPool, body.CIDR, body.VIPScanParallel, body.VIPProbeTarget, body.VIPScanRange, body.VIPCandidates, ipsec)
+		env += " VPN_XL2TPD_SOURCE_FILE=" + shellQuote(sourceTmp)
 		prepareUsers := ""
-		cleanup := "rm -f " + shellQuote(tmp)
+		cleanup := "rm -f " + shellQuote(tmp) + " " + shellQuote(sourceTmp)
 		if usersTmp != "" {
 			prepareUsers = "SUDO=sudo; [ \"$(id -u)\" -eq 0 ] && SUDO=; $SUDO mkdir -p /etc/l2tp-vpn; $SUDO install -m 600 " + shellQuote(usersTmp) + " " + l2tpUsersPath + "; "
 			cleanup += " " + shellQuote(usersTmp)
 		}
-		command := fmt.Sprintf("set -e; chmod 700 %s; %sif [ \"$(id -u)\" -eq 0 ]; then env %s bash %s; else sudo env %s bash %s; fi; %s", shellQuote(tmp), prepareUsers, env, shellQuote(tmp), env, shellQuote(tmp), cleanup)
+		command := fmt.Sprintf("set -e; trap %s EXIT; chmod 700 %s; %sif [ \"$(id -u)\" -eq 0 ]; then env %s bash %s; else sudo env %s bash %s; fi", shellQuote(cleanup), shellQuote(tmp), prepareUsers, env, shellQuote(tmp), env, shellQuote(tmp))
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 		defer cancel()
 		var result map[string]any

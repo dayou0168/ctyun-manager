@@ -24,3 +24,4 @@ ctyun-manager.zip
 ctyun-manager-deploy-*.zip
 *.zip
 *.tar.gz
+!third_party/xl2tpd-v1.3.20.tar.gz

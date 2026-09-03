@@ -2,9 +2,10 @@
 set -euo pipefail
 
 version="1.3.20"
-source_url="https://github.com/xelerance/xl2tpd/archive/refs/tags/v${version}.tar.gz"
 expected_sha="3db95450c5e1efaeea7547af344b5621f4453af3c227f26ec43bcbc79087b045"
 test_dir="$(mktemp -d)"
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+source_archive="${XL2TPD_SOURCE_ARCHIVE:-$repo_dir/third_party/xl2tpd-v${version}.tar.gz}"
 
 cleanup() {
   local resolved
@@ -16,8 +17,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 \
-  "$source_url" -o "$test_dir/xl2tpd.tar.gz"
+test -f "$source_archive"
+cp -- "$source_archive" "$test_dir/xl2tpd.tar.gz"
 printf '%s  %s\n' "$expected_sha" "$test_dir/xl2tpd.tar.gz" | sha256sum -c -
 tar -xzf "$test_dir/xl2tpd.tar.gz" -C "$test_dir"
 

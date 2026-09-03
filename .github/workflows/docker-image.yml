@@ -20,6 +20,7 @@ on:
       - "install-linux.sh"
       - "upgrade-go-docker.sh"
       - "install-l2tp-server.sh"
+      - "third_party/**"
       - "tests/**"
   workflow_dispatch:
 
