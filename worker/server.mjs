@@ -53,7 +53,8 @@ async function sessionAuthorized(context) {
     const response=await context.request.fetch(urls.balance,{headers:{accept:"application/json, text/plain, */*","x-requested-with":"XMLHttpRequest"},timeout:30000});
     if(!response.ok()||[401,403].includes(response.status()))return false;
     const text=await response.text();if(!text.trim().startsWith("{"))return false;
-    return !/not.?login|unauthorized|未登录|登录已失效|请先登录/i.test(text.slice(0,2000));
+    const parsed=JSON.parse(text);if(/not.?login|unauthorized|未登录|登录已失效|请先登录/i.test(text.slice(0,2000)))return false;
+    return amount(findDeep(parsed,["cashPoints","availableBalance","availableAmount","cashBalance","availableCash"]))!==null||String(findDeep(parsed,["accountId","accountID","account_id","tenantId","tenantID"])??"").trim()!=="";
   } catch { return false; }
 }
 async function ensureLogin(account, target=urls.recharge) {
