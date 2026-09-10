@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { firstVisible, isLoginURL, isSecurityChallengeText, loginFailureMessage, waitForVisibleText } from "./login-page.mjs";
+import { firstVisible, formatOfficialFeedback, isLoginURL, isSecurityChallengeText, loginFailureMessage, waitForVisibleText } from "./login-page.mjs";
 
 test("normal SMS login copy is not treated as a security challenge", () => {
   assert.equal(isSecurityChallengeText("短信登录 请输入短信验证码 获取验证码"), false);
@@ -19,6 +19,10 @@ test("login errors are classified without exposing page contents", () => {
     message: "天翼云拒绝了账号密码，请检查平台内保存的登录资料",
   });
   assert.equal(loginFailureMessage("欢迎登录天翼云"), null);
+});
+
+test("official feedback formatting includes only sanitized response fields", () => {
+  assert.equal(formatOfficialFeedback([{ path: "/gw/auth/Login", http_status: 200, code: "E1", message: "密码错误" }]), "/gw/auth/Login HTTP 200 code=E1 message=密码错误");
 });
 
 test("firstVisible accepts duplicate locators and selects the visible field", async () => {

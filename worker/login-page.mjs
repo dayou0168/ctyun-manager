@@ -77,3 +77,35 @@ export async function safeLoginDiagnostics(page) {
   const title = await page.title().catch(() => "");
   return { url: page.url(), title, placeholders: [...new Set(placeholders)].slice(0, 8) };
 }
+
+function deepValue(value, keys) {
+  if (Array.isArray(value)) for (const item of value) { const found = deepValue(item, keys); if (found !== undefined) return found; }
+  else if (value && typeof value === "object") {
+    for (const key of keys) if (value[key] !== undefined && value[key] !== null) return value[key];
+    for (const item of Object.values(value)) { const found = deepValue(item, keys); if (found !== undefined) return found; }
+  }
+}
+
+export async function captureOfficialFeedback(response) {
+  const rawURL = response.url();
+  const parsedURL = new URL(rawURL);
+  if (parsedURL.origin !== "https://www.ctyun.cn" || !parsedURL.pathname.startsWith("/gw/")) return null;
+  const status = response.status();
+  const contentType = String((await response.allHeaders().catch(() => ({})))["content-type"] || "");
+  if (!/json/i.test(contentType)) return status >= 400 ? { path: parsedURL.pathname, http_status: status } : null;
+  const payload = await response.json().catch(() => null);
+  if (!payload) return status >= 400 ? { path: parsedURL.pathname, http_status: status } : null;
+  const code = deepValue(payload, ["code", "errorCode", "error_code"]);
+  const message = deepValue(payload, ["message", "msg", "reason", "errorMessage", "error_description"]);
+  if (code === undefined && message === undefined && status < 400) return null;
+  return {
+    path: parsedURL.pathname,
+    http_status: status,
+    code: String(code ?? "").slice(0, 80),
+    message: String(message ?? "").replace(/\s+/g, " ").slice(0, 200),
+  };
+}
+
+export function formatOfficialFeedback(items = []) {
+  return items.slice(-5).map((item) => `${item.path} HTTP ${item.http_status}${item.code ? ` code=${item.code}` : ""}${item.message ? ` message=${item.message}` : ""}`).join("；");
+}

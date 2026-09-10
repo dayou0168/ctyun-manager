@@ -2,7 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { chromium } from "playwright";
 import { RechargeService, RECHARGE_URL } from "./recharge.mjs";
-import { fillAnyVisible, firstVisible, firstVisibleButton, isLoginURL, isSecurityChallengeText, loginFailureMessage, safeLoginDiagnostics, waitForVisibleText } from "./login-page.mjs";
+import { captureOfficialFeedback, fillAnyVisible, firstVisible, firstVisibleButton, formatOfficialFeedback, isLoginURL, isSecurityChallengeText, loginFailureMessage, safeLoginDiagnostics, waitForVisibleText } from "./login-page.mjs";
 
 const port = Number(process.env.CTYUN_BROWSER_WORKER_PORT || 18080);
 const token = process.env.CTYUN_BROWSER_WORKER_TOKEN || "";
@@ -46,7 +46,7 @@ async function getSession(account) {
   const id=String(account.id);let session=sessions.get(id);if(session)return session;
   browser ||= await chromium.launch({headless,args:["--no-sandbox","--disable-dev-shm-usage"]});
   const options={locale:"zh-CN",timezoneId:"Asia/Shanghai"};if(account.storage_state&&typeof account.storage_state==="object")options.storageState=account.storage_state;
-  const context=await browser.newContext(options);const page=await context.newPage();session={context,page,lastUsed:Date.now()};sessions.set(id,session);return session;
+  const context=await browser.newContext(options);const page=await context.newPage();session={context,page,lastUsed:Date.now(),officialFeedback:[]};page.on("response",async response=>{const item=await captureOfficialFeedback(response).catch(()=>null);if(item){session.officialFeedback.push(item);session.officialFeedback=session.officialFeedback.slice(-20);}});sessions.set(id,session);return session;
 }
 async function sessionAuthorized(context) {
   try {
@@ -64,6 +64,7 @@ async function ensureLogin(account, target=urls.recharge) {
   const tab=await waitForVisibleText(page,"账号登录",15000);
   if(!tab){const text=await page.locator("body").innerText().catch(()=>"");const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`登录页加载超时（${diagnostics.title||"未知页面"}，${diagnostics.url}）`,session};}
   await tab.click();
+  session.officialFeedback=[];
   const [userOK,passOK]=await Promise.all([
     fillAnyVisible(page,["登录名/邮箱","请输入登录名","请输入账号","用户名/邮箱"],account.username||"",10000),
     fillAnyVisible(page,["请输入密码","登录密码","密码"],account.password||"",10000),
@@ -85,7 +86,7 @@ async function ensureLogin(account, target=urls.recharge) {
     if(!isLoginURL(page.url())&&Date.now()>=nextAuthCheck){if(await sessionAuthorized(session.context)){authorized=true;break;}nextAuthCheck=Date.now()+1500;}
     await page.waitForTimeout(500);
   }
-  if(!authorized){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码|动态口令|Google\s*(?:验证码|验证)/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};const diagnostics=await safeLoginDiagnostics(page);const fields=diagnostics.placeholders.join("、")||"无";return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`天翼云登录态校验未通过（页面：${diagnostics.title||"未知"}；输入框：${fields}）`,session};}
+  if(!authorized){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码|动态口令|Google\s*(?:验证码|验证)/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};const diagnostics=await safeLoginDiagnostics(page);const fields=diagnostics.placeholders.join("、")||"无";const official=formatOfficialFeedback(session.officialFeedback);return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`天翼云登录态校验未通过（页面：${diagnostics.title||"未知"}；输入框：${fields}${official?`；官方返回：${official}`:""}）`,session};}
   if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
   await page.waitForTimeout(3000);if(isLoginURL(page.url())||!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验未通过，请检查账号密码、动态验证码或官方安全验证",session};
   return {status:"ready",message:"天翼云登录状态正常",session};
