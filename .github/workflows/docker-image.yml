@@ -37,7 +37,9 @@ jobs:
       - name: Install ARM64 cross compiler
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Check installer shell syntax
-        run: bash -n install-l2tp-server.sh tests/verify-xl2tpd-source-build.sh
+        run: bash -n install-l2tp-server.sh tests/verify-xl2tpd-source-build.sh tests/verify-l2tp-sysctl-persistence.sh
+      - name: Verify L2TP sysctl boot persistence
+        run: bash tests/verify-l2tp-sysctl-persistence.sh
       - name: Compile pinned xl2tpd for ARM64
         env:
           CC: aarch64-linux-gnu-gcc

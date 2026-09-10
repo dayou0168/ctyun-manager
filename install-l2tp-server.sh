@@ -2106,10 +2106,9 @@ EOF
 
 configure_sysctl() {
   log "Configuring kernel forwarding..."
-  # CTyunOS ships /etc/sysctl.d/99-sysctl.conf with ip_forward=0.  Use a
-  # lexically later drop-in so systemd-sysctl keeps the VPN settings after a
-  # reboot, then apply this exact file last because `sysctl --system` also
-  # processes /etc/sysctl.conf after the drop-in directories.
+  # CTyunOS can process /etc/sysctl.conf again after the drop-in directories.
+  # Apply this exact file last during installation; the egress helper repeats
+  # it after network-online.target on every boot.
   rm -f /etc/sysctl.d/99-l2tp-vpn.conf
   cat >/etc/sysctl.d/zz-l2tp-vpn.conf <<EOF
 net.ipv4.ip_forward = 1
@@ -2857,6 +2856,33 @@ write_helper_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+L2TP_SYSCTL_FILE=/etc/sysctl.d/zz-l2tp-vpn.conf
+
+apply_kernel_network_settings() {
+  if [ -r "$L2TP_SYSCTL_FILE" ]; then
+    sysctl -p "$L2TP_SYSCTL_FILE" >/dev/null
+  else
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+  fi
+
+  # CTyunOS legacy network-scripts may restore strict reverse-path filtering
+  # after systemd-sysctl. Cover the uplink and any PPP devices that already
+  # exist; default.rp_filter=0 covers PPP devices created later.
+  sysctl -w "net.ipv4.conf.${VPN_IFACE}.rp_filter=0" >/dev/null 2>&1 || true
+  local rp_filter_path
+  for rp_filter_path in /proc/sys/net/ipv4/conf/ppp*/rp_filter; do
+    [ -e "$rp_filter_path" ] || continue
+    printf '0\n' >"$rp_filter_path"
+  done
+
+  if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf '0')" != "1" ]; then
+    echo "Could not enable net.ipv4.ip_forward for L2TP traffic." >&2
+    exit 1
+  fi
+}
+
 wait_for_iface() {
   local iface="$1"
   local i
@@ -2915,6 +2941,7 @@ if [ -n "${VPN_VIPS:-}" ]; then
 fi
 
 wait_for_iface "$VPN_IFACE"
+apply_kernel_network_settings
 
 MANAGED_SNAT_COMMENT="ctyun-l2tp-managed-snat"
 INGRESS_DNAT_COMMENT="ctyun-l2tp-ingress-dnat"
