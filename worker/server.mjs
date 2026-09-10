@@ -48,9 +48,17 @@ async function getSession(account) {
   const options={locale:"zh-CN",timezoneId:"Asia/Shanghai"};if(account.storage_state&&typeof account.storage_state==="object")options.storageState=account.storage_state;
   const context=await browser.newContext(options);const page=await context.newPage();session={context,page,lastUsed:Date.now()};sessions.set(id,session);return session;
 }
+async function sessionAuthorized(context) {
+  try {
+    const response=await context.request.fetch(urls.balance,{headers:{accept:"application/json, text/plain, */*","x-requested-with":"XMLHttpRequest"},timeout:30000});
+    if(!response.ok()||[401,403].includes(response.status()))return false;
+    const text=await response.text();if(!text.trim().startsWith("{"))return false;
+    return !/not.?login|unauthorized|未登录|登录已失效|请先登录/i.test(text.slice(0,2000));
+  } catch { return false; }
+}
 async function ensureLogin(account, target=urls.recharge) {
   const session=await getSession(account);const {page}=session;session.lastUsed=Date.now();await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
-  await page.waitForTimeout(2500);if(!isLoginURL(page.url()))return {status:"ready",message:"天翼云登录状态正常",session};
+  await page.waitForTimeout(2500);if(!isLoginURL(page.url())&&await sessionAuthorized(session.context))return {status:"ready",message:"天翼云登录状态正常",session};
   await page.goto(urls.login,{waitUntil:"domcontentloaded",timeout:60000});
   const tab=await waitForVisibleText(page,"账号登录",15000);
   if(!tab){const text=await page.locator("body").innerText().catch(()=>"");const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`登录页加载超时（${diagnostics.title||"未知页面"}，${diagnostics.url}）`,session};}
@@ -60,7 +68,7 @@ async function ensureLogin(account, target=urls.recharge) {
     fillAnyVisible(page,["请输入密码","登录密码","密码"],account.password||"",10000),
   ]);
   if(!userOK||!passOK){const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:`登录表单无法自动识别（可见输入框：${diagnostics.placeholders.join("、")||"无"}；${diagnostics.url}）`,session};}
-  for(const checkbox of await page.locator('input[type="checkbox"]').all())if(!(await checkbox.isChecked())){await checkbox.check({force:true}).catch(()=>{});break;}
+  const agreement=await firstVisible(page.locator('input[type="checkbox"]'));if(agreement&&!await agreement.isChecked())await agreement.check({force:true}).catch(()=>{});
   const login=await firstVisibleButton(page,["登录"]);if(!login)return {status:"manual_required",message:"天翼云登录按钮未加载完成",session};await login.click();
   let totpSubmitted=false;const loginDeadline=Date.now()+30000;
   while(Date.now()<loginDeadline&&isLoginURL(page.url())){
@@ -77,7 +85,7 @@ async function ensureLogin(account, target=urls.recharge) {
   }
   if(isLoginURL(page.url())){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":"仍停留在天翼云登录页，请检查保存的登录账号和密码",session};}
   if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
-  await page.waitForTimeout(3000);if(isLoginURL(page.url()))return {status:"login_failed",message:"天翼云登录后又被跳回登录页，请检查账号密码、动态验证码或官方安全验证",session};
+  await page.waitForTimeout(3000);if(isLoginURL(page.url())||!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验未通过，请检查账号密码、动态验证码或官方安全验证",session};
   return {status:"ready",message:"天翼云登录状态正常",session};
 }
 async function requestJSON(context,url,method="GET",data,referer=urls.recharge) {const cookies=await context.cookies(url);const csrf=cookies.find(cookie=>cookie.name==="csrftoken")?.value||"";const headers={accept:"application/json, text/plain, */*","accept-language":"zh-CN",origin:"https://www.ctyun.cn",referer,"x-requested-with":"XMLHttpRequest"};if(csrf)headers["x-csrftoken"]=csrf;const response=await context.request.fetch(url,{method,data,headers,timeout:45000});if([401,403].includes(response.status()))throw new Error("official_cookie_unauthorized");const text=await response.text();let parsed;try{parsed=JSON.parse(text)}catch{throw new Error(`official_not_json:${text.slice(0,200)}`)}return parsed;}

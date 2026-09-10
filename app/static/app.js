@@ -8325,14 +8325,14 @@ async function openConsoleWithBridge(payload) {
 async function openOfficialConsole(accountId) {
   const id = Number(accountId || 0);
   if (!id) return toast("请先选择一个账号");
-  const hasBridge = await detectConsoleBridge();
-  if (!hasBridge) {
-    window.open("/static/ctyun-console-bridge/install.html", "_blank");
-    return toast("未检测到控制台桥接扩展，已打开安装说明");
-  }
   toast(`正在准备 ${accountName(id)} 的官方控制台登录态...`);
   try {
     const result = await api(`/api/accounts/${id}/console/bridge-state`, { method: "POST" });
+    const hasBridge = await detectConsoleBridge();
+    if (!hasBridge) {
+      window.open("/static/ctyun-console-bridge/install.html", "_blank");
+      return toast("服务器登录态已建立；安装控制台桥接扩展后可在本机打开官方控制台");
+    }
     const bridgeResult = await openConsoleWithBridge(result);
     if (bridgeResult.ok) toast(bridgeResult.message || "已在本机浏览器打开官方控制台");
     else toast(bridgeResult.message || "扩展打开官方控制台失败");
