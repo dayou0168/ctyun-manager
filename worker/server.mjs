@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { chromium } from "playwright";
 import { RechargeService, RECHARGE_URL } from "./recharge.mjs";
+import { fillAnyVisible, firstVisibleButton, isLoginURL, isSecurityChallengeText, safeLoginDiagnostics, waitForLoginToFinish, waitForVisibleText } from "./login-page.mjs";
 
 const port = Number(process.env.CTYUN_BROWSER_WORKER_PORT || 18080);
 const token = process.env.CTYUN_BROWSER_WORKER_TOKEN || "";
@@ -47,8 +48,6 @@ async function getSession(account) {
   const options={locale:"zh-CN",timezoneId:"Asia/Shanghai"};if(account.storage_state&&typeof account.storage_state==="object")options.storageState=account.storage_state;
   const context=await browser.newContext(options);const page=await context.newPage();session={context,page,lastUsed:Date.now()};sessions.set(id,session);return session;
 }
-async function visible(page,text){const loc=page.getByText(text,{exact:true});for(let i=0;i<await loc.count();i++)if(await loc.nth(i).isVisible())return loc.nth(i);return null;}
-async function fill(page,placeholders,value){for(const p of placeholders){const loc=page.getByPlaceholder(p,{exact:true});if(await loc.count()===1&&await loc.isVisible()){await loc.fill(value);return true;}}return false;}
 async function sessionAuthorized(context) {
   try {
     const response=await context.request.fetch(urls.account,{headers:{accept:"application/json, text/plain, */*","x-requested-with":"XMLHttpRequest"},timeout:30000});
@@ -62,16 +61,20 @@ async function sessionAuthorized(context) {
 }
 async function ensureLogin(account, target=urls.recharge) {
   const session=await getSession(account);const {page}=session;session.lastUsed=Date.now();await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
-  if(!/login|sso|passport|\/auth\//i.test(page.url())&&await sessionAuthorized(session.context))return {status:"ready",message:"天翼云登录状态正常",session};
+  if(!isLoginURL(page.url())&&await sessionAuthorized(session.context))return {status:"ready",message:"天翼云登录状态正常",session};
   await page.goto(urls.login,{waitUntil:"domcontentloaded",timeout:60000});
-  const text=(await page.locator("body").innerText().catch(()=>""));if(/滑块验证|人机验证|图形验证码|短信验证码/.test(text))return {status:"manual_required",message:"官方页面要求人工安全验证",session};
-  const tab=await visible(page,"账号登录");if(tab)await tab.click();
-  const userOK=await fill(page,["登录名/邮箱","请输入登录名","请输入账号"],account.username||"");const passOK=await fill(page,["请输入密码","登录密码"],account.password||"");
-  if(!userOK||!passOK)return {status:"manual_required",message:"登录表单无法自动识别",session};
+  const tab=await waitForVisibleText(page,"账号登录",15000);
+  if(!tab){const text=await page.locator("body").innerText().catch(()=>"");const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`登录页加载超时（${diagnostics.title||"未知页面"}，${diagnostics.url}）`,session};}
+  await tab.click();
+  const [userOK,passOK]=await Promise.all([
+    fillAnyVisible(page,["登录名/邮箱","请输入登录名","请输入账号","用户名/邮箱"],account.username||"",10000),
+    fillAnyVisible(page,["请输入密码","登录密码","密码"],account.password||"",10000),
+  ]);
+  if(!userOK||!passOK){const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:`登录表单无法自动识别（可见输入框：${diagnostics.placeholders.join("、")||"无"}；${diagnostics.url}）`,session};}
   for(const checkbox of await page.locator('input[type="checkbox"]').all())if(!(await checkbox.isChecked())){await checkbox.check({force:true}).catch(()=>{});break;}
-  const login=page.getByRole("button",{name:"登录",exact:true});if(await login.count())await login.last().click();
-  await page.waitForTimeout(1200);const code=totp(account.totp_secret);if(code){if(30-Math.floor(Date.now()/1000)%30<=4)await page.waitForTimeout(5000);const ok=await fill(page,["请输入6位动态验证码","请输入动态验证码","请输入谷歌验证码","请输入Google验证码","请输入MFA验证码"],totp(account.totp_secret));if(ok){for(const name of ["登录","确认","验证","下一步"]){const btn=page.getByRole("button",{name,exact:true});if(await btn.count()&&await btn.last().isVisible()){await btn.last().click();break;}}}}
-  await page.waitForTimeout(2500);if(/login|sso|passport|\/auth\//i.test(page.url()))return {status:"login_failed",message:"仍停留在天翼云登录页，请检查登录资料或安全验证",session};
+  const login=await firstVisibleButton(page,["登录"]);if(!login)return {status:"manual_required",message:"天翼云登录按钮未加载完成",session};await login.click();
+  await page.waitForTimeout(1200);const code=totp(account.totp_secret);if(code&&isLoginURL(page.url())){if(30-Math.floor(Date.now()/1000)%30<=4)await page.waitForTimeout(5000);const ok=await fillAnyVisible(page,["请输入6位动态验证码","请输入动态验证码","请输入谷歌验证码","请输入Google验证码","请输入MFA验证码"],totp(account.totp_secret),6000);if(ok){const btn=await firstVisibleButton(page,["登录","确认","验证","下一步"]);if(btn)await btn.click();}}
+  await waitForLoginToFinish(page,15000);if(isLoginURL(page.url())){const text=await page.locator("body").innerText().catch(()=>"");return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":"仍停留在天翼云登录页，请检查登录资料或安全验证",session};}
   if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
   if(!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验失败，请检查账号密码、动态验证码或官方安全验证",session};
   return {status:"ready",message:"天翼云登录状态正常",session};

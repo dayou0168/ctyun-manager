@@ -26,7 +26,7 @@ COPY --from=go-build /out/ctyun-manager /app/ctyun-manager
 COPY app/static /app/app/static
 COPY install-l2tp-server.sh /app/install-l2tp-server.sh
 COPY third_party/xl2tpd-v1.3.20.tar.gz /app/third_party/xl2tpd-v1.3.20.tar.gz
-COPY worker/package.json worker/pnpm-lock.yaml worker/server.mjs worker/recharge.mjs /app/worker/
+COPY worker/package.json worker/pnpm-lock.yaml worker/server.mjs worker/recharge.mjs worker/login-page.mjs /app/worker/
 RUN npm install --global pnpm@10.15.1 --no-audit --no-fund \
     && cd /app/worker && pnpm install --prod --frozen-lockfile \
     && mkdir -p /app/data/home \
