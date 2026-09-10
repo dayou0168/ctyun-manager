@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { firstVisible, isLoginURL, isSecurityChallengeText, waitForVisibleText } from "./login-page.mjs";
+import { firstVisible, isLoginURL, isSecurityChallengeText, loginFailureMessage, waitForVisibleText } from "./login-page.mjs";
 
 test("normal SMS login copy is not treated as a security challenge", () => {
   assert.equal(isSecurityChallengeText("短信登录 请输入短信验证码 获取验证码"), false);
@@ -11,6 +11,14 @@ test("normal SMS login copy is not treated as a security challenge", () => {
 test("login URL recognition covers the current auth route", () => {
   assert.equal(isLoginURL("https://www.ctyun.cn/h5/auth/login"), true);
   assert.equal(isLoginURL("https://console.ctyun.cn/compute/index/"), false);
+});
+
+test("login errors are classified without exposing page contents", () => {
+  assert.deepEqual(loginFailureMessage("用户名或密码错误"), {
+    status: "login_failed",
+    message: "天翼云拒绝了账号密码，请检查平台内保存的登录资料",
+  });
+  assert.equal(loginFailureMessage("欢迎登录天翼云"), null);
 });
 
 test("firstVisible accepts duplicate locators and selects the visible field", async () => {

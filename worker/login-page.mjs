@@ -49,6 +49,17 @@ export async function firstVisibleButton(page, names) {
   return null;
 }
 
+export function loginFailureMessage(text = "") {
+  const value = String(text);
+  if (/动态验证码错误|验证码不正确|验证码已失效|动态口令错误/i.test(value)) {
+    return { status: "totp_failed", message: "MFA 动态验证码未通过，请检查保存的 TOTP 密钥和服务器 NTP 时间" };
+  }
+  if (/账号或密码错误|用户名或密码错误|密码错误|账号不存在|登录失败|帐号或密码错误/i.test(value)) {
+    return { status: "login_failed", message: "天翼云拒绝了账号密码，请检查平台内保存的登录资料" };
+  }
+  return null;
+}
+
 export async function waitForLoginToFinish(page, timeout = 15000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
