@@ -85,7 +85,7 @@ async function ensureLogin(account, target=urls.recharge) {
     if(!isLoginURL(page.url())&&Date.now()>=nextAuthCheck){if(await sessionAuthorized(session.context)){authorized=true;break;}nextAuthCheck=Date.now()+1500;}
     await page.waitForTimeout(500);
   }
-  if(!authorized){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码|动态口令|Google\s*(?:验证码|验证)/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":"天翼云登录态校验未通过，请检查保存的登录账号和密码",session};}
+  if(!authorized){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码|动态口令|Google\s*(?:验证码|验证)/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};const diagnostics=await safeLoginDiagnostics(page);const fields=diagnostics.placeholders.join("、")||"无";return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`天翼云登录态校验未通过（页面：${diagnostics.title||"未知"}；输入框：${fields}）`,session};}
   if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
   await page.waitForTimeout(3000);if(isLoginURL(page.url())||!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验未通过，请检查账号密码、动态验证码或官方安全验证",session};
   return {status:"ready",message:"天翼云登录状态正常",session};
