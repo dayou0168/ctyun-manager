@@ -89,7 +89,8 @@ function deepValue(value, keys) {
 export async function captureOfficialFeedback(response) {
   const rawURL = response.url();
   const parsedURL = new URL(rawURL);
-  if (parsedURL.origin !== "https://www.ctyun.cn" || !parsedURL.pathname.startsWith("/gw/")) return null;
+  const method = response.request().method();
+  if (parsedURL.origin !== "https://www.ctyun.cn" || method !== "POST" || /\/qrcode\/Verify$/i.test(parsedURL.pathname)) return null;
   const status = response.status();
   const contentType = String((await response.allHeaders().catch(() => ({})))["content-type"] || "");
   if (!/json/i.test(contentType)) return status >= 400 ? { path: parsedURL.pathname, http_status: status } : null;
@@ -99,7 +100,7 @@ export async function captureOfficialFeedback(response) {
   const message = deepValue(payload, ["message", "msg", "reason", "errorMessage", "error_description"]);
   if (code === undefined && message === undefined && status < 400) return null;
   return {
-    path: parsedURL.pathname,
+    path: `${method} ${parsedURL.pathname}`,
     http_status: status,
     code: String(code ?? "").slice(0, 80),
     message: String(message ?? "").replace(/\s+/g, " ").slice(0, 200),

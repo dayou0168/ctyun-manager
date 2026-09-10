@@ -22,7 +22,7 @@ test("login errors are classified without exposing page contents", () => {
 });
 
 test("official feedback formatting includes only sanitized response fields", () => {
-  assert.equal(formatOfficialFeedback([{ path: "/gw/auth/Login", http_status: 200, code: "E1", message: "密码错误" }]), "/gw/auth/Login HTTP 200 code=E1 message=密码错误");
+  assert.equal(formatOfficialFeedback([{ path: "POST /gw/auth/Login", http_status: 200, code: "E1", message: "密码错误" }]), "POST /gw/auth/Login HTTP 200 code=E1 message=密码错误");
 });
 
 test("firstVisible accepts duplicate locators and selects the visible field", async () => {
