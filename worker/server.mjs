@@ -57,10 +57,14 @@ async function sessionAuthorized(context) {
     return amount(findDeep(parsed,["cashPoints","availableBalance","availableAmount","cashBalance","availableCash"]))!==null||String(findDeep(parsed,["accountId","accountID","account_id","tenantId","tenantID"])??"").trim()!=="";
   } catch { return false; }
 }
+async function navigate(page,url) {
+  try { await page.goto(url,{waitUntil:"domcontentloaded",timeout:60000}); }
+  catch(error) { if(!/net::ERR_ABORTED/i.test(String(error?.message||error)))throw error;await page.waitForTimeout(1200); }
+}
 async function ensureLogin(account, target=urls.recharge) {
-  const session=await getSession(account);const {page}=session;session.lastUsed=Date.now();await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
+  const session=await getSession(account);const {page}=session;session.lastUsed=Date.now();await navigate(page,target);
   await page.waitForTimeout(2500);if(!isLoginURL(page.url())&&await sessionAuthorized(session.context))return {status:"ready",message:"天翼云登录状态正常",session};
-  await page.goto(urls.login,{waitUntil:"domcontentloaded",timeout:60000});
+  await navigate(page,urls.login);
   const tab=await waitForVisibleText(page,"账号登录",15000);
   if(!tab){const text=await page.locator("body").innerText().catch(()=>"");const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`登录页加载超时（${diagnostics.title||"未知页面"}，${diagnostics.url}）`,session};}
   await tab.click();
@@ -87,7 +91,7 @@ async function ensureLogin(account, target=urls.recharge) {
     await page.waitForTimeout(500);
   }
   if(!authorized){const text=await page.locator("body").innerText().catch(()=>"");const failure=loginFailureMessage(text);if(failure)return {...failure,session};if(/您已经开启MFA验证|请输入6位动态验证码|动态验证码|动态口令|Google\s*(?:验证码|验证)/i.test(text))return {status:"totp_failed",message:"仍停留在 MFA 验证页面，请检查保存的 TOTP 密钥和服务器 NTP 时间",session};const diagnostics=await safeLoginDiagnostics(page);const fields=diagnostics.placeholders.join("、")||"无";const official=formatOfficialFeedback(session.officialFeedback);return {status:isSecurityChallengeText(text)?"manual_required":"login_failed",message:isSecurityChallengeText(text)?"官方页面要求人工安全验证":`天翼云登录态校验未通过（页面：${diagnostics.title||"未知"}；输入框：${fields}${official?`；官方返回：${official}`:""}）`,session};}
-  if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
+  if(page.url()!==target)await navigate(page,target);
   await page.waitForTimeout(3000);if(isLoginURL(page.url())||!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验未通过，请检查账号密码、动态验证码或官方安全验证",session};
   return {status:"ready",message:"天翼云登录状态正常",session};
 }
