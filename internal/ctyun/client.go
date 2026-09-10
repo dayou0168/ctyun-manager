@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -228,69 +229,118 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 	if len(variants) == 0 {
 		variants = []map[string]any{{}}
 	}
+	type regionResult struct {
+		items      []map[string]any
+		successes  int
+		problems   []string
+		incomplete bool
+	}
+	regionResults := make([]regionResult, len(request.RegionIDs))
+	jobs := make(chan int)
+	workers := min(8, len(request.RegionIDs))
+	var wait sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for index := range jobs {
+				region := request.RegionIDs[index]
+				local := regionResult{}
+				for _, path := range paths {
+					for _, variant := range variants {
+						page, total := 1, 1
+						for page <= total && page <= 200 {
+							if ctx.Err() != nil {
+								break
+							}
+							params := map[string]any{"regionID": region}
+							for k, v := range request.Extra {
+								params[k] = v
+							}
+							for k, v := range variant {
+								params[k] = v
+							}
+							if request.Paging {
+								params["pageNo"] = page
+								params["pageSize"] = 50
+								if request.ResourceType == "vpc" || request.ResourceType == "subnet" {
+									params["pageNumber"] = page
+									delete(params, "pageNo")
+								}
+								if request.ResourceType == "eip" {
+									params["page"] = page
+								}
+							}
+							data, err := c.Request(ctx, request.Endpoint, path, request.Method, params)
+							if err != nil {
+								if !unsupportedRegionError(err) {
+									local.problems = append(local.problems, fmt.Sprintf("%s %s: %v", path, region, err))
+									local.incomplete = local.incomplete || page > 1
+								}
+								break
+							}
+							local.successes++
+							if request.Paging {
+								total = TotalPages(data)
+							}
+							for _, item := range Items(data) {
+								if resourceID(item, request.ResourceType) == "" {
+									continue
+								}
+								copy := map[string]any{}
+								for k, v := range item {
+									copy[k] = v
+								}
+								copy["_api_path"] = path
+								copy["_scan_region"] = region
+								local.items = append(local.items, copy)
+							}
+							page++
+						}
+					}
+				}
+				if local.successes > 0 && !local.incomplete {
+					// Paths and variants are compatibility alternatives. A successful
+					// response for this region supersedes earlier variant failures.
+					local.problems = nil
+				}
+				regionResults[index] = local
+			}
+		}()
+	}
+	for index := range request.RegionIDs {
+		jobs <- index
+	}
+	close(jobs)
+	wait.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("同步资源时请求被中止: %w", err)
+	}
 	result := []map[string]any{}
 	seen := map[string]bool{}
-	successes := 0
 	problems := []string{}
-	for _, path := range paths {
-		for _, region := range request.RegionIDs {
-			for _, variant := range variants {
-				page, total := 1, 1
-				for page <= total && page <= 200 {
-					params := map[string]any{"regionID": region}
-					for k, v := range request.Extra {
-						params[k] = v
-					}
-					for k, v := range variant {
-						params[k] = v
-					}
-					if request.Paging {
-						params["pageNo"] = page
-						params["pageSize"] = 50
-						if request.ResourceType == "vpc" || request.ResourceType == "subnet" {
-							params["pageNumber"] = page
-							delete(params, "pageNo")
-						}
-						if request.ResourceType == "eip" {
-							params["page"] = page
-						}
-					}
-					data, err := c.Request(ctx, request.Endpoint, path, request.Method, params)
-					if err != nil {
-						problems = append(problems, fmt.Sprintf("%s %s: %v", path, region, err))
-						break
-					}
-					successes++
-					if request.Paging {
-						total = TotalPages(data)
-					}
-					for _, item := range Items(data) {
-						id := resourceID(item, request.ResourceType)
-						if id == "" {
-							continue
-						}
-						key := id + ":" + region
-						if seen[key] {
-							continue
-						}
-						seen[key] = true
-						copy := map[string]any{}
-						for k, v := range item {
-							copy[k] = v
-						}
-						copy["_api_path"] = path
-						copy["_scan_region"] = region
-						result = append(result, copy)
-					}
-					page++
-				}
+	for index, local := range regionResults {
+		region := request.RegionIDs[index]
+		problems = append(problems, local.problems...)
+		for _, item := range local.items {
+			id := resourceID(item, request.ResourceType)
+			key := id + ":" + region
+			if id == "" || seen[key] {
+				continue
 			}
+			seen[key] = true
+			result = append(result, item)
 		}
 	}
-	if successes == 0 && len(problems) > 0 {
+	if len(problems) > 0 {
 		return nil, errors.New(strings.Join(problems, "；"))
 	}
 	return result, nil
+}
+
+func unsupportedRegionError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "region is not supported") || strings.Contains(message, "region not supported")
 }
 
 func resourceID(item map[string]any, kind string) string {

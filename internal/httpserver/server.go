@@ -108,6 +108,7 @@ func New(cfg config.Config, logger *slog.Logger, store ReadStore, keys *security
 	mux.HandleFunc("PUT /api/linux/servers/{server_id}", s.requireUser(s.updateLinuxServer))
 	mux.HandleFunc("DELETE /api/linux/servers/{server_id}", s.requireUser(s.deleteLinuxServer))
 	mux.HandleFunc("POST /api/linux/servers/{server_id}/test", s.requireUser(s.testLinuxServer))
+	mux.HandleFunc("POST /api/linux/servers/{server_id}/fingerprint/accept", s.requireUser(s.acceptLinuxFingerprint))
 	mux.HandleFunc("POST /api/linux/servers/{server_id}/command", s.requireUser(s.linuxCommand))
 	mux.HandleFunc("POST /api/linux/servers/{server_id}/files/list", s.requireUser(s.linuxFilesList))
 	mux.HandleFunc("POST /api/linux/servers/{server_id}/files/read", s.requireUser(s.linuxFileRead))

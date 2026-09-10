@@ -2,6 +2,7 @@ package ctyun
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -58,6 +59,31 @@ func TestItemsFlattensNestedLists(t *testing.T) {
 	t.Parallel()
 	items := Items(map[string]any{"returnObj": []any{map[string]any{"vpcs": []any{map[string]any{"id": "v1"}}}}})
 	if len(items) != 1 || items[0]["id"] != "v1" {
+		t.Fatalf("items=%#v", items)
+	}
+}
+
+func TestListAllIgnoresUnsupportedRegionsAndKeepsSupportedResults(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["regionID"] == "unsupported" {
+			_, _ = w.Write([]byte(`{"statusCode":900,"message":"cloudDesktop region is not supported by the API currently"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"totalPage":1,"results":[{"instanceID":"ecs-1"}]}}`))
+	}))
+	defer server.Close()
+	client := New("ak", "sk", time.Second)
+	items, err := client.ListAll(context.Background(), ListRequest{
+		Endpoint: server.URL, Path: "/ecs", Method: http.MethodPost, ResourceType: "ecs",
+		RegionIDs: []string{"unsupported", "supported"}, Paging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0]["_scan_region"] != "supported" {
 		t.Fatalf("items=%#v", items)
 	}
 }

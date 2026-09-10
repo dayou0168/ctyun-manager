@@ -84,6 +84,7 @@ const state = {
   linuxFileLoadedServerId: 0,
   linuxL2tpVipCandidates: [],
   linuxL2tpVipCandidatesScanned: false,
+  linuxFingerprintPrompts: new Set(),
   linuxToolTab: localStorage.getItem("ctyun:linuxToolTab") || "file",
   linuxFileTypeahead: "",
   linuxFileTypeaheadArea: "",
@@ -171,7 +172,7 @@ function resourceRowsSnapshot(type, path, accountId = selectedAccountId()) {
 function refreshResourcePathInBackground(type, path, seq, viewName = state.view) {
   cachedApi(path, 90000)
     .then(async (freshRows) => {
-      if (state.view !== viewName || !isActiveRender(seq)) return;
+      if (state.view !== viewName || !isActiveRender(seq) || hasBlockingUserInteraction()) return;
       state.resources[type] = freshRows;
       await render();
     })
@@ -3087,7 +3088,11 @@ function connectLinuxSocket(serverId, options = {}) {
       }, 600);
     }
   };
-  socket.onmessage = (event) => appendLinuxTerminal(String(event.data || ""), serverId);
+  socket.onmessage = (event) => {
+    const message = String(event.data || "");
+    appendLinuxTerminal(message, serverId);
+    if (message.includes("SSH 主机指纹已变化")) promptLinuxFingerprintChange(serverId, message);
+  };
   socket.onerror = () => appendLinuxTerminal("\r\n[平台提示] SSH WebSocket 连接异常。\r\n", serverId);
   socket.onclose = () => {
     appendLinuxTerminal("\r\n[平台提示] SSH 会话已关闭。\r\n", serverId);
@@ -3096,6 +3101,29 @@ function connectLinuxSocket(serverId, options = {}) {
       state.linuxSocketServerId = 0;
     }
   };
+}
+
+function promptLinuxFingerprintChange(serverId, message = "") {
+  const key = `fingerprint:${Number(serverId)}`;
+  if (state.linuxFingerprintPrompts.has(key) || $("#actionDialog")?.open) return;
+  state.linuxFingerprintPrompts.add(key);
+  const summary = String(message).replace(/\s+/g, " ").trim();
+  confirmAction(
+    "确认 SSH 主机指纹变化",
+    `${summary}\n\n只有在服务器重装、SSH 主机密钥确实变更，或你确认这是同一台服务器时才继续。确认后平台会重新认证并保存新指纹。`,
+    async () => {
+      try {
+        const result = await api(`/api/linux/servers/${serverId}/fingerprint/accept`, { method: "POST" });
+        clearApiCache("/api/linux/servers");
+        toast(result.message || "SSH 主机指纹已更新");
+        await render();
+        connectLinuxSocket(serverId, { preserveTerminal: true });
+      } finally {
+        state.linuxFingerprintPrompts.delete(key);
+      }
+    },
+  );
+  $("#actionDialog")?.addEventListener("close", () => state.linuxFingerprintPrompts.delete(key), { once: true });
 }
 
 function linuxSelectedText() {
@@ -3967,7 +3995,11 @@ function bindLinuxActions(servers = []) {
       await render();
       toast("SSH 连接测试成功");
     } catch (error) {
-      toast(error.message);
+      if (String(error.message || "").includes("SSH 主机指纹已变化")) {
+        promptLinuxFingerprintChange(Number(button.dataset.linuxTest), error.message);
+      } else {
+        toast(error.message);
+      }
     }
   });
   document.querySelectorAll("[data-linux-connect]").forEach((button) => button.onclick = async () => {
@@ -5815,7 +5847,7 @@ function finishPostActionSyncJob(key, accountId, types, checks, resultState = "c
 async function renderBackgroundViewIfActive(types, startedView) {
   if (state.view !== startedView) return;
   if (Date.now() < state.viewSwitchUntil) return;
-  if (state.manualSyncing || $("#fieldsDialog")?.open || document.hidden) return;
+  if (state.manualSyncing || document.hidden || hasBlockingUserInteraction()) return;
   if (!viewMatchesResourceTypes(types)) return;
   await new Promise((resolve) => {
     if ("requestIdleCallback" in window) {
@@ -5824,7 +5856,7 @@ async function renderBackgroundViewIfActive(types, startedView) {
       window.setTimeout(resolve, 40);
     }
   });
-  if (state.view !== startedView || Date.now() < state.viewSwitchUntil) return;
+  if (state.view !== startedView || Date.now() < state.viewSwitchUntil || hasBlockingUserInteraction()) return;
   await render();
 }
 
@@ -6332,7 +6364,7 @@ async function finalizeSubmittedAction(accountId, resourceType, action, resource
 async function refreshCurrentView(silent = true) {
   if (state.initializing) return;
   if (Date.now() < state.viewSwitchUntil) return;
-  if (state.manualSyncing || $("#fieldsDialog")?.open) return;
+  if (state.manualSyncing || hasBlockingUserInteraction()) return;
   if (state.refreshing) {
     state.refreshQueued = true;
     return;
@@ -6345,7 +6377,7 @@ async function refreshCurrentView(silent = true) {
 
 async function syncCurrentView(silent = true) {
   if (state.initializing || document.hidden) return;
-  if (state.manualSyncing || $("#fieldsDialog")?.open) return;
+  if (state.manualSyncing || hasBlockingUserInteraction()) return;
   const types = currentViewSyncTypes();
   const accountId = selectedAccountId();
   if (!types.length || !accountId) {
@@ -6358,7 +6390,7 @@ async function syncCurrentView(silent = true) {
 
 function scheduleCurrentViewBackgroundSync(silent = true) {
   const types = currentViewSyncTypes();
-  if (!types.length || document.hidden || state.manualSyncing || $("#fieldsDialog")?.open) return;
+  if (!types.length || document.hidden || state.manualSyncing || hasBlockingUserInteraction()) return;
   const accountId = selectedAccountId();
   if (!accountId) return;
   const startedView = state.view;
@@ -6394,12 +6426,30 @@ function autoRefreshInterval() {
   return 0;
 }
 
+function hasBlockingUserInteraction() {
+  if (document.querySelector("dialog[open]")) return true;
+  const root = $("#content");
+  if (!root) return false;
+  const active = document.activeElement;
+  if (active && root.contains(active) && (active.matches("input, textarea, select, [contenteditable='true']"))) return true;
+  for (const control of root.querySelectorAll("input, textarea, select")) {
+    if (control.disabled || control.type === "hidden" || control.type === "button" || control.type === "submit") continue;
+    if ((control.type === "checkbox" || control.type === "radio") && control.checked !== control.defaultChecked) return true;
+    if (control.tagName === "SELECT") {
+      if ([...control.options].some((option) => option.selected !== option.defaultSelected)) return true;
+      continue;
+    }
+    if (control.value !== control.defaultValue) return true;
+  }
+  return false;
+}
+
 function configureAutoRefresh(runSoon = false) {
   clearInterval(state.refreshTimer);
   const interval = autoRefreshInterval();
   if (!interval) return;
   state.refreshTimer = setInterval(() => {
-    if (state.manualSyncing || Date.now() < state.viewSwitchUntil || $("#fieldsDialog")?.open) return;
+    if (state.manualSyncing || Date.now() < state.viewSwitchUntil || hasBlockingUserInteraction()) return;
     refreshCurrentView(true).catch(() => {});
   }, interval);
   if (runSoon && !state.initializing && !document.hidden && !state.manualSyncing && Date.now() >= state.viewSwitchUntil) {

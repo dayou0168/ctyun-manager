@@ -1,4 +1,4 @@
-const CTYUN_TARGET_DEFAULT = "https://console.ctyun.cn/console/index/#/console";
+const CTYUN_TARGET_DEFAULT = "https://console.ctyun.cn/compute/index/#/ecm/list";
 
 function isCtyunHost(host) {
   const normalized = String(host || "").toLowerCase().replace(/^\./, "");

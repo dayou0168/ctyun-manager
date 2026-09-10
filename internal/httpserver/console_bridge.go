@@ -3,7 +3,6 @@ package httpserver
 import (
 	"archive/zip"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -16,27 +15,30 @@ import (
 	"github.com/dayou0168/ctyun-manager/internal/security"
 )
 
+const ctyunConsoleTargetURL = "https://console.ctyun.cn/compute/index/#/ecm/list"
+
 func (s *Server) consoleBridgeState(w http.ResponseWriter, r *http.Request, _ security.Session) {
 	id, account, ok := s.actionAccount(w, r)
 	if !ok {
 		return
 	}
 
-	message := "已从保存的登录态生成本机浏览器控制台登录态"
-	var state map[string]any
-	if result, err := s.callBrowserWorker(r.Context(), "/v1/open", account, map[string]any{"target": "console"}); err == nil {
-		s.persistBrowserResult(r.Context(), id, result, false)
-		state, _ = result["storage_state"].(map[string]any)
-		message = "已刷新并生成本机浏览器控制台登录态"
-	} else {
-		raw, decryptErr := s.keys.DecryptString(account.CookieEncrypted)
-		if decryptErr != nil {
-			writeDetail(w, http.StatusConflict, "该账号没有可导出的天翼云登录态，请先刷新余额或打开充值页面。")
-			return
-		}
-		_ = json.Unmarshal([]byte(raw), &state)
-		message += "；后台保活未确认，如果打开后是登录页，请刷新账号登录态"
+	result, err := s.callBrowserWorker(r.Context(), "/v1/open", account, map[string]any{"target": "console"})
+	if err != nil {
+		writeDetail(w, http.StatusBadGateway, "无法刷新天翼云官方登录态："+err.Error())
+		return
 	}
+	if status := firstText(result, "status"); status != "ready" {
+		message := firstText(result, "message")
+		if message == "" {
+			message = "天翼云官方登录态未建立"
+		}
+		writeDetail(w, http.StatusConflict, message)
+		return
+	}
+	s.persistBrowserResult(r.Context(), id, result, false)
+	state, _ := result["storage_state"].(map[string]any)
+	message := "已校验并刷新本机浏览器控制台登录态"
 
 	filtered := filterCTyunStorageState(state)
 	cookies, _ := filtered["cookies"].([]any)
@@ -50,7 +52,7 @@ func (s *Server) consoleBridgeState(w http.ResponseWriter, r *http.Request, _ se
 		"message":       message,
 		"account_id":    id,
 		"account_name":  account.Name,
-		"target_url":    "https://console.ctyun.cn/console/index/#/console",
+		"target_url":    ctyunConsoleTargetURL,
 		"storage_state": filtered,
 		"cookie_count":  len(cookies),
 		"origin_count":  len(origins),

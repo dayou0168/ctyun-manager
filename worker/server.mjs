@@ -14,6 +14,7 @@ let browser;
 const urls = {
   recharge: RECHARGE_URL,
   console: "https://console.ctyun.cn/compute/index/#/ecm/list",
+  login: "https://www.ctyun.cn/h5/auth/login",
   balance: "https://www.ctyun.cn/gw/account/giftcard/QueryBookSumm",
   owe: "https://www.ctyun.cn/v1/bcc/bill/QueryOwe",
   account: "https://www.ctyun.cn/v2/bcc/basicData/getCurrentInfo",
@@ -48,9 +49,21 @@ async function getSession(account) {
 }
 async function visible(page,text){const loc=page.getByText(text,{exact:true});for(let i=0;i<await loc.count();i++)if(await loc.nth(i).isVisible())return loc.nth(i);return null;}
 async function fill(page,placeholders,value){for(const p of placeholders){const loc=page.getByPlaceholder(p,{exact:true});if(await loc.count()===1&&await loc.isVisible()){await loc.fill(value);return true;}}return false;}
+async function sessionAuthorized(context) {
+  try {
+    const response=await context.request.fetch(urls.account,{headers:{accept:"application/json, text/plain, */*","x-requested-with":"XMLHttpRequest"},timeout:30000});
+    if(!response.ok()||[401,403].includes(response.status()))return false;
+    const text=await response.text();
+    if(!text.trim().startsWith("{"))return false;
+    return !/not.?login|unauthorized|未登录|登录已失效|请先登录/i.test(text.slice(0,2000));
+  } catch {
+    return false;
+  }
+}
 async function ensureLogin(account, target=urls.recharge) {
   const session=await getSession(account);const {page}=session;session.lastUsed=Date.now();await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
-  if(!/login|sso|passport/i.test(page.url()))return {status:"ready",message:"天翼云登录状态正常",session};
+  if(!/login|sso|passport|\/auth\//i.test(page.url())&&await sessionAuthorized(session.context))return {status:"ready",message:"天翼云登录状态正常",session};
+  await page.goto(urls.login,{waitUntil:"domcontentloaded",timeout:60000});
   const text=(await page.locator("body").innerText().catch(()=>""));if(/滑块验证|人机验证|图形验证码|短信验证码/.test(text))return {status:"manual_required",message:"官方页面要求人工安全验证",session};
   const tab=await visible(page,"账号登录");if(tab)await tab.click();
   const userOK=await fill(page,["登录名/邮箱","请输入登录名","请输入账号"],account.username||"");const passOK=await fill(page,["请输入密码","登录密码"],account.password||"");
@@ -58,8 +71,10 @@ async function ensureLogin(account, target=urls.recharge) {
   for(const checkbox of await page.locator('input[type="checkbox"]').all())if(!(await checkbox.isChecked())){await checkbox.check({force:true}).catch(()=>{});break;}
   const login=page.getByRole("button",{name:"登录",exact:true});if(await login.count())await login.last().click();
   await page.waitForTimeout(1200);const code=totp(account.totp_secret);if(code){if(30-Math.floor(Date.now()/1000)%30<=4)await page.waitForTimeout(5000);const ok=await fill(page,["请输入6位动态验证码","请输入动态验证码","请输入谷歌验证码","请输入Google验证码","请输入MFA验证码"],totp(account.totp_secret));if(ok){for(const name of ["登录","确认","验证","下一步"]){const btn=page.getByRole("button",{name,exact:true});if(await btn.count()&&await btn.last().isVisible()){await btn.last().click();break;}}}}
-  await page.waitForTimeout(1500);if(/login|sso|passport/i.test(page.url()))return {status:"login_failed",message:"仍停留在天翼云登录页，请检查登录资料或安全验证",session};
-  if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});return {status:"ready",message:"天翼云登录状态正常",session};
+  await page.waitForTimeout(2500);if(/login|sso|passport|\/auth\//i.test(page.url()))return {status:"login_failed",message:"仍停留在天翼云登录页，请检查登录资料或安全验证",session};
+  if(page.url()!==target)await page.goto(target,{waitUntil:"domcontentloaded",timeout:60000});
+  if(!await sessionAuthorized(session.context))return {status:"login_failed",message:"天翼云登录态校验失败，请检查账号密码、动态验证码或官方安全验证",session};
+  return {status:"ready",message:"天翼云登录状态正常",session};
 }
 async function requestJSON(context,url,method="GET",data,referer=urls.recharge) {const cookies=await context.cookies(url);const csrf=cookies.find(cookie=>cookie.name==="csrftoken")?.value||"";const headers={accept:"application/json, text/plain, */*","accept-language":"zh-CN",origin:"https://www.ctyun.cn",referer,"x-requested-with":"XMLHttpRequest"};if(csrf)headers["x-csrftoken"]=csrf;const response=await context.request.fetch(url,{method,data,headers,timeout:45000});if([401,403].includes(response.status()))throw new Error("official_cookie_unauthorized");const text=await response.text();let parsed;try{parsed=JSON.parse(text)}catch{throw new Error(`official_not_json:${text.slice(0,200)}`)}return parsed;}
 async function finance(account) {const ready=await ensureLogin(account);const state=await ready.session.context.storageState();if(ready.status!=="ready")return {...ready,session:undefined,storage_state:state,available:null,owe:null};const [b,o,a]=await Promise.all([requestJSON(ready.session.context,urls.balance),requestJSON(ready.session.context,urls.owe),requestJSON(ready.session.context,urls.account)]);const available=amount(findDeep(b,["cashPoints","availableBalance","availableAmount","cashBalance","availableCash"]));return {status:available===null?"finance_error":"ready",message:available===null?"官方余额接口没有返回可识别余额":"余额已从天翼云官方接口读取",available,owe:amount(findDeep(o,["realOwe","oweAmount","arrears","outstandingAmount"])),provider_account_id:String(findDeep(b,["accountId","accountID","account_id"])??findDeep(a,["accountId","accountID","account_id","tenantId","tenantID"])??""),storage_state:state,url:ready.session.page.url()};}

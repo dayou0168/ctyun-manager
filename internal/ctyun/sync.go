@@ -63,7 +63,9 @@ func (s *Syncer) Sync(ctx context.Context, accountID int64, kinds, overrideRegio
 	}
 	var lock sync.Mutex
 	var wait sync.WaitGroup
-	limit := make(chan struct{}, 6)
+	// Each resource type scans regions with its own bounded worker pool. Keep the
+	// outer fan-out small so a full account sync does not burst the provider API.
+	limit := make(chan struct{}, 3)
 	for _, kind := range valid {
 		kind := kind
 		wait.Add(1)
@@ -112,6 +114,7 @@ func (s *Syncer) SyncKind(ctx context.Context, account storage.AccountRecord, ki
 	if len(regions) == 0 {
 		regions = ParseRegionIDs(s.Config.DefaultRegionIDs)
 	}
+	discoverAllRegions := len(regions) == 0
 	regionNames := map[string]string{}
 	listed, regionErr := client.ListRegions(ctx, s.Config.RegionEndpoint, s.Config.RegionListPath)
 	if regionErr == nil {
@@ -119,7 +122,7 @@ func (s *Syncer) SyncKind(ctx context.Context, account storage.AccountRecord, ki
 			id := first(region["regionID"])
 			if id != "" {
 				regionNames[id] = first(region["regionName"], id)
-				if len(regions) == 0 {
+				if discoverAllRegions {
 					regions = append(regions, id)
 				}
 			}

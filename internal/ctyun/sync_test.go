@@ -65,3 +65,33 @@ func TestSyncECSAcrossPages(t *testing.T) {
 		t.Fatalf("count=%d store=%#v", count, store)
 	}
 }
+
+func TestSyncECSDiscoversEveryRegionWhenAccountScopeIsEmpty(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/regions" {
+			_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"regionList":[{"regionID":"r1","regionName":"One"},{"regionID":"r2","regionName":"Two"}]}}`))
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		region := body["regionID"].(string)
+		_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"totalPage":1,"results":[{"instanceID":"ecs-` + region + `","regionID":"` + region + `"}]}}`))
+	}))
+	defer server.Close()
+	keys, err := security.LoadKeyring("missing", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ak, _ := keys.EncryptString("ak")
+	sk, _ := keys.EncryptString("sk")
+	store := &memorySyncStore{account: storage.AccountRecord{Account: storage.Account{ID: 3, AKEncrypted: ak}, SKEncrypted: sk}}
+	syncer := Syncer{Config: config.Config{RegionEndpoint: server.URL, RegionListPath: "/regions", ECSEndpoint: server.URL, ECSListPath: "/ecs", OpenAPITimeout: time.Second}, Keys: keys, Store: store}
+	count, err := syncer.SyncKind(context.Background(), store.account, "ecs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || len(store.regions) != 2 || len(store.writes) != 2 {
+		t.Fatalf("count=%d store=%#v", count, store)
+	}
+}

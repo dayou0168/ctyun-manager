@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "天翼云控制台桥接",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "从天翼云管理平台接收登录态，并在本机 Chrome 打开已登录的天翼云官方控制台。",
   "permissions": ["cookies", "tabs", "scripting"],
   "host_permissions": [

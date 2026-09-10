@@ -3,7 +3,6 @@ package sshmanager
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -71,7 +70,7 @@ func Connect(ctx context.Context, c Config, timeout time.Duration) (*Connection,
 	}
 	fingerprint := ""
 	callback := func(_ string, _ net.Addr, key ssh.PublicKey) error {
-		fingerprint = key.Type() + " " + base64.StdEncoding.EncodeToString(key.Marshal())[:18] + "..."
+		fingerprint = HostFingerprint(key)
 		if c.ExpectedFingerprint != "" && c.ExpectedFingerprint != fingerprint {
 			return fmt.Errorf("SSH 主机指纹已变化：原 %s，现 %s", c.ExpectedFingerprint, fingerprint)
 		}
@@ -89,6 +88,13 @@ func Connect(ctx context.Context, c Config, timeout time.Duration) (*Connection,
 		return nil, fmt.Errorf("SSH 认证失败: %w", err)
 	}
 	return &Connection{Client: ssh.NewClient(cc, ch, reqs), Fingerprint: fingerprint}, nil
+}
+
+func HostFingerprint(key ssh.PublicKey) string {
+	if key == nil {
+		return ""
+	}
+	return key.Type() + " " + ssh.FingerprintSHA256(key)
 }
 
 func (c *Connection) Close() {
