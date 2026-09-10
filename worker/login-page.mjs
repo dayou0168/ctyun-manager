@@ -90,7 +90,7 @@ export async function captureOfficialFeedback(response) {
   const rawURL = response.url();
   const parsedURL = new URL(rawURL);
   const method = response.request().method();
-  if (parsedURL.origin !== "https://www.ctyun.cn" || method !== "POST" || /\/qrcode\/Verify$/i.test(parsedURL.pathname)) return null;
+  if (parsedURL.origin !== "https://www.ctyun.cn" || method !== "POST" || /\/qrcode\/Verify$|^\/collection\//i.test(parsedURL.pathname)) return null;
   const status = response.status();
   const contentType = String((await response.allHeaders().catch(() => ({})))["content-type"] || "");
   if (!/json/i.test(contentType)) return status >= 400 ? { path: parsedURL.pathname, http_status: status } : null;
