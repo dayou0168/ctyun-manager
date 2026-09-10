@@ -111,7 +111,14 @@ async function api(path, options = {}) {
     throw new Error("请重新登录");
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || "请求失败");
+  if (!response.ok) {
+    const error = new Error(data.detail || "请求失败");
+    const linuxServerMatch = String(path || "").match(/^\/api\/linux\/servers\/(\d+)\//);
+    if (linuxServerMatch && String(error.message || "").includes("SSH 主机指纹已变化")) {
+      window.setTimeout(() => promptLinuxFingerprintChange(Number(linuxServerMatch[1]), error.message), 0);
+    }
+    throw error;
+  }
   return data;
 }
 
@@ -3105,7 +3112,16 @@ function connectLinuxSocket(serverId, options = {}) {
 
 function promptLinuxFingerprintChange(serverId, message = "") {
   const key = `fingerprint:${Number(serverId)}`;
-  if (state.linuxFingerprintPrompts.has(key) || $("#actionDialog")?.open) return;
+  if (state.linuxFingerprintPrompts.has(key)) return;
+  const activeDialog = $("#actionDialog");
+  if (activeDialog?.open) {
+    state.linuxFingerprintPrompts.add(key);
+    activeDialog.addEventListener("close", () => {
+      state.linuxFingerprintPrompts.delete(key);
+      window.setTimeout(() => promptLinuxFingerprintChange(serverId, message), 0);
+    }, { once: true });
+    return;
+  }
   state.linuxFingerprintPrompts.add(key);
   const summary = String(message).replace(/\s+/g, " ").trim();
   confirmAction(
@@ -3848,6 +3864,7 @@ function renderLinuxWorkspace(servers = [], selected = null) {
         <button data-linux-connect="${server.id}">${connected ? "重连" : "连接"}</button>
         ${connected ? `<button data-linux-disconnect type="button">断开</button>` : ""}
         <button data-linux-test="${server.id}">测试</button>
+        ${String(server.last_message || "").includes("SSH 主机指纹已变化") ? `<button data-linux-fingerprint="${server.id}" type="button">确认指纹</button>` : ""}
         <button data-linux-edit="${server.id}">编辑</button>
         <button class="danger" data-linux-delete="${server.id}">删除</button>
       </div>
@@ -4001,6 +4018,11 @@ function bindLinuxActions(servers = []) {
         toast(error.message);
       }
     }
+  });
+  document.querySelectorAll("[data-linux-fingerprint]").forEach((button) => button.onclick = () => {
+    const serverId = Number(button.dataset.linuxFingerprint);
+    const server = servers.find((item) => Number(item.id) === serverId);
+    promptLinuxFingerprintChange(serverId, server?.last_message || "SSH 主机指纹已变化");
   });
   document.querySelectorAll("[data-linux-connect]").forEach((button) => button.onclick = async () => {
     const serverId = Number(button.dataset.linuxConnect);
