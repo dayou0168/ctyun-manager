@@ -74,7 +74,7 @@ async function ensureLogin(account, target=urls.recharge) {
     fillAnyVisible(page,["请输入密码","登录密码","密码"],account.password||"",10000),
   ]);
   if(!userOK||!passOK){const diagnostics=await safeLoginDiagnostics(page);return {status:"manual_required",message:`登录表单无法自动识别（可见输入框：${diagnostics.placeholders.join("、")||"无"}；${diagnostics.url}）`,session};}
-  const accountForm=await firstVisible(page.locator("form.account"));const agreement=accountForm?.locator('input[type="checkbox"]');if(agreement&&await agreement.count()&&!await agreement.isChecked()){await accountForm.locator(".el-checkbox__inner").click();if(!await agreement.isChecked())return {status:"manual_required",message:"无法勾选天翼云用户协议",session};}
+  const accountForm=await firstVisible(page.locator("form.account"));const agreement=accountForm?.locator('input[type="checkbox"]');if(agreement&&await agreement.count()&&!await agreement.isChecked()){await accountForm.locator(".el-checkbox__inner").click();await page.waitForTimeout(200);if(!await agreement.isChecked()){await agreement.evaluate(element=>element.click());await page.waitForTimeout(200);}if(!await agreement.isChecked())return {status:"manual_required",message:"无法勾选天翼云用户协议",session};}
   const login=await firstVisibleButton(page,["登录"]);if(!login)return {status:"manual_required",message:"天翼云登录按钮未加载完成",session};await login.click();
   let totpSubmitted=false,authorized=false,nextAuthCheck=0;const loginDeadline=Date.now()+30000;
   while(Date.now()<loginDeadline){
