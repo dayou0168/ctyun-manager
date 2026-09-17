@@ -56,28 +56,50 @@ type Finance struct {
 }
 
 type Resource struct {
-	ID           int64
-	AccountID    int64
-	ResourceType string
-	ProviderID   string
-	Name         string
-	Region       string
-	Status       string
-	BillingMode  string
-	PayloadJSON  string
-	SyncedAt     string
+	ID            int64
+	AccountID     int64
+	ResourceType  string
+	ProviderID    string
+	Name          string
+	Region        string
+	Status        string
+	BillingMode   string
+	PayloadJSON   string
+	SyncedAt      string
+	SyncState     string
+	LastSeenAt    *string
+	LastSuccessAt *string
+	SyncError     string
 }
 
 type ResourceWrite struct {
 	ProviderID, Name, Region, Status, BillingMode, PayloadJSON string
 }
 
+type RegionSync struct {
+	AccountID    int64
+	ResourceType string
+	Region       string
+	Status       string
+	ItemCount    int
+	Error        string
+}
+
+type ActionJob struct {
+	ID, ResourceType, ResourceID, Action, Region, PayloadJSON, ResultJSON, Status, LastError string
+	AccountID                                                                                int64
+	Attempts                                                                                 int
+	NextAttemptAt                                                                            int64
+}
+
 func (s *Store) ResourceByProvider(ctx context.Context, accountID int64, resourceType, providerID string) (Resource, error) {
 	var row Resource
 	err := s.db.QueryRowContext(ctx, `select id,account_id,resource_type,provider_id,name,region,status,
-		billing_mode,payload_json,synced_at from resources where account_id=? and resource_type=? and provider_id=?`,
+		billing_mode,payload_json,synced_at,sync_state,last_seen_at,last_success_at,sync_error
+		from resources where account_id=? and resource_type=? and provider_id=?`,
 		accountID, resourceType, providerID).Scan(&row.ID, &row.AccountID, &row.ResourceType, &row.ProviderID,
-		&row.Name, &row.Region, &row.Status, &row.BillingMode, &row.PayloadJSON, &row.SyncedAt)
+		&row.Name, &row.Region, &row.Status, &row.BillingMode, &row.PayloadJSON, &row.SyncedAt,
+		&row.SyncState, &row.LastSeenAt, &row.LastSuccessAt, &row.SyncError)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Resource{}, ErrNotFound
 	}
@@ -115,9 +137,10 @@ type Operation struct {
 }
 
 type DashboardSummary struct {
-	AccountCount   int64            `json:"account_count"`
-	ResourceCounts map[string]int64 `json:"resource_counts"`
-	Finance        []Finance        `json:"finance"`
+	AccountCount        int64            `json:"account_count"`
+	ResourceCounts      map[string]int64 `json:"resource_counts"`
+	StaleResourceCounts map[string]int64 `json:"stale_resource_counts"`
+	Finance             []Finance        `json:"finance"`
 }
 
 type Store struct {
@@ -129,7 +152,15 @@ func OpenReadOnly(path string) (*Store, error) {
 }
 
 func OpenReadWrite(path string) (*Store, error) {
-	return open(path, false)
+	store, err := open(path, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Migrate(context.Background()); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
 func open(path string, readOnly bool) (*Store, error) {
@@ -287,6 +318,12 @@ func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
 	if _, err = tx.ExecContext(ctx, "delete from resources where account_id=?", id); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, "delete from resource_sync_regions where account_id=?", id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "delete from resource_action_jobs where account_id=?", id); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `insert into operations(account_id,resource_type,resource_id,action,status,message)
 		values(?,'account',?,'delete_account','success','')`, id, fmt.Sprint(id)); err != nil {
 		return err
@@ -331,7 +368,7 @@ func (s *Store) UpsertFinance(ctx context.Context, accountID int64, available, o
 
 func (s *Store) Resources(ctx context.Context, resourceType string, accountID *int64) ([]Resource, error) {
 	query := `select id, account_id, resource_type, provider_id, name, region, status,
-	                 billing_mode, payload_json, synced_at
+	                 billing_mode, payload_json, synced_at, sync_state, last_seen_at, last_success_at, sync_error
 	          from resources where resource_type = ?`
 	args := []any{resourceType}
 	if accountID != nil {
@@ -348,7 +385,8 @@ func (s *Store) Resources(ctx context.Context, resourceType string, accountID *i
 	for rows.Next() {
 		var row Resource
 		if err := rows.Scan(&row.ID, &row.AccountID, &row.ResourceType, &row.ProviderID, &row.Name,
-			&row.Region, &row.Status, &row.BillingMode, &row.PayloadJSON, &row.SyncedAt); err != nil {
+			&row.Region, &row.Status, &row.BillingMode, &row.PayloadJSON, &row.SyncedAt,
+			&row.SyncState, &row.LastSeenAt, &row.LastSuccessAt, &row.SyncError); err != nil {
 			return nil, fmt.Errorf("scan resource: %w", err)
 		}
 		result = append(result, row)
@@ -390,6 +428,46 @@ func (s *Store) ReplaceResources(ctx context.Context, accountID int64, resourceT
 			return fmt.Errorf("upsert resource %s: %w", item.ProviderID, err)
 		}
 	}
+	if len(targetRegions) > 0 {
+		if _, err = tx.ExecContext(ctx, `update resources set sync_state='fresh',last_seen_at=current_timestamp,
+			last_success_at=current_timestamp,sync_error='' where account_id=? and resource_type=? and region in (`+
+			strings.TrimRight(strings.Repeat("?,", len(targetRegions)), ",")+")", append([]any{accountID, resourceType}, stringArgs(targetRegions)...)...); err != nil {
+			return fmt.Errorf("mark resources fresh: %w", err)
+		}
+	} else if _, err = tx.ExecContext(ctx, `update resources set sync_state='fresh',last_seen_at=current_timestamp,
+		last_success_at=current_timestamp,sync_error='' where account_id=? and resource_type=?`, accountID, resourceType); err != nil {
+		return fmt.Errorf("mark resources fresh: %w", err)
+	}
+	return tx.Commit()
+}
+
+func stringArgs(values []string) []any {
+	result := make([]any, 0, len(values))
+	for _, value := range values {
+		result = append(result, value)
+	}
+	return result
+}
+
+func (s *Store) RecordRegionSync(ctx context.Context, value RegionSync) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	statement := `insert into resource_sync_regions(account_id,resource_type,region,status,item_count,error,last_attempt_at,last_success_at)
+		values(?,?,?,?,?,?,current_timestamp,case when ?='success' then current_timestamp else null end) on conflict(account_id,resource_type,region) do update set
+		status=excluded.status,item_count=excluded.item_count,error=excluded.error,last_attempt_at=current_timestamp,
+		last_success_at=case when excluded.status='success' then current_timestamp else resource_sync_regions.last_success_at end`
+	if _, err = tx.ExecContext(ctx, statement, value.AccountID, value.ResourceType, value.Region, value.Status, value.ItemCount, value.Error, value.Status); err != nil {
+		return fmt.Errorf("record region sync: %w", err)
+	}
+	if value.Status != "success" {
+		if _, err = tx.ExecContext(ctx, `update resources set sync_state='stale',sync_error=?
+			where account_id=? and resource_type=? and region=?`, value.Error, value.AccountID, value.ResourceType, value.Region); err != nil {
+			return fmt.Errorf("mark region resources stale: %w", err)
+		}
+	}
 	return tx.Commit()
 }
 
@@ -419,21 +497,26 @@ func (s *Store) Operations(ctx context.Context, limit int) ([]Operation, error) 
 func (s *Store) DashboardSummary(ctx context.Context) (DashboardSummary, error) {
 	var result DashboardSummary
 	result.ResourceCounts = map[string]int64{}
+	result.StaleResourceCounts = map[string]int64{}
 	if err := s.db.QueryRowContext(ctx, "select count(*) from ctyun_accounts").Scan(&result.AccountCount); err != nil {
 		return DashboardSummary{}, fmt.Errorf("count accounts: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, "select resource_type, count(*) from resources group by resource_type")
+	rows, err := s.db.QueryContext(ctx, `select resource_type,
+		sum(case when sync_state='fresh' then 1 else 0 end),
+		sum(case when sync_state<>'fresh' then 1 else 0 end)
+		from resources group by resource_type`)
 	if err != nil {
 		return DashboardSummary{}, fmt.Errorf("count resources: %w", err)
 	}
 	for rows.Next() {
 		var resourceType string
-		var count int64
-		if err := rows.Scan(&resourceType, &count); err != nil {
+		var count, stale int64
+		if err := rows.Scan(&resourceType, &count, &stale); err != nil {
 			rows.Close()
 			return DashboardSummary{}, fmt.Errorf("scan resource count: %w", err)
 		}
 		result.ResourceCounts[resourceType] = count
+		result.StaleResourceCounts[resourceType] = stale
 	}
 	if err := rows.Close(); err != nil {
 		return DashboardSummary{}, fmt.Errorf("close resource counts: %w", err)
@@ -446,4 +529,42 @@ func (s *Store) DashboardSummary(ctx context.Context) (DashboardSummary, error) 
 		return DashboardSummary{}, err
 	}
 	return result, nil
+}
+
+func (s *Store) CreateActionJob(ctx context.Context, value ActionJob) error {
+	_, err := s.db.ExecContext(ctx, `insert into resource_action_jobs
+		(id,account_id,resource_type,resource_id,action,region,payload_json,result_json,status,attempts,next_attempt_at,last_error)
+		values(?,?,?,?,?,?,?,?,?,0,?,'')`, value.ID, value.AccountID, value.ResourceType, value.ResourceID,
+		value.Action, value.Region, value.PayloadJSON, value.ResultJSON, value.Status, value.NextAttemptAt)
+	if err != nil {
+		return fmt.Errorf("create resource action job: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DueActionJobs(ctx context.Context, now int64, limit int) ([]ActionJob, error) {
+	rows, err := s.db.QueryContext(ctx, `select id,account_id,resource_type,resource_id,action,region,payload_json,
+		result_json,status,attempts,next_attempt_at,last_error from resource_action_jobs
+		where status in ('pending','retrying') and next_attempt_at<=? order by next_attempt_at,id limit ?`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query due resource jobs: %w", err)
+	}
+	defer rows.Close()
+	result := []ActionJob{}
+	for rows.Next() {
+		var item ActionJob
+		if err := rows.Scan(&item.ID, &item.AccountID, &item.ResourceType, &item.ResourceID, &item.Action,
+			&item.Region, &item.PayloadJSON, &item.ResultJSON, &item.Status, &item.Attempts,
+			&item.NextAttemptAt, &item.LastError); err != nil {
+			return nil, fmt.Errorf("scan resource job: %w", err)
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) UpdateActionJob(ctx context.Context, id, status, lastError string, attempts int, nextAttemptAt int64) error {
+	_, err := s.db.ExecContext(ctx, `update resource_action_jobs set status=?,last_error=?,attempts=?,next_attempt_at=?,updated_at=current_timestamp where id=?`,
+		status, lastError, attempts, nextAttemptAt, id)
+	return err
 }

@@ -14,10 +14,12 @@ import (
 )
 
 type memorySyncStore struct {
-	account storage.AccountRecord
-	kind    string
-	regions []string
-	writes  []storage.ResourceWrite
+	account      storage.AccountRecord
+	kind         string
+	regions      []string
+	writes       []storage.ResourceWrite
+	replacements int
+	regionSyncs  []storage.RegionSync
 }
 
 func (m *memorySyncStore) AccountByID(context.Context, int64) (storage.AccountRecord, error) {
@@ -25,12 +27,53 @@ func (m *memorySyncStore) AccountByID(context.Context, int64) (storage.AccountRe
 }
 func (m *memorySyncStore) ReplaceResources(_ context.Context, _ int64, kind string, regions []string, writes []storage.ResourceWrite) error {
 	m.kind = kind
-	m.regions = regions
-	m.writes = writes
+	m.regions = append(m.regions, regions...)
+	m.writes = append(m.writes, writes...)
+	m.replacements++
+	return nil
+}
+func (m *memorySyncStore) RecordRegionSync(_ context.Context, value storage.RegionSync) error {
+	m.regionSyncs = append(m.regionSyncs, value)
 	return nil
 }
 func (m *memorySyncStore) RecordOperation(context.Context, *int64, string, string, string, string, string) error {
 	return nil
+}
+
+func TestSyncKeepsSuccessfulRegionAndMarksDeniedRegionStale(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/regions" {
+			_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"regionList":[{"regionID":"allowed"},{"regionID":"denied"}]}}`))
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["regionID"] == "denied" {
+			_, _ = w.Write([]byte(`{"statusCode":900,"message":"region is not allow to access"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"totalPage":1,"results":[{"instanceID":"ecs-ok","regionID":"allowed"}]}}`))
+	}))
+	defer server.Close()
+	keys, err := security.LoadKeyring("missing", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ak, _ := keys.EncryptString("ak")
+	sk, _ := keys.EncryptString("sk")
+	store := &memorySyncStore{account: storage.AccountRecord{Account: storage.Account{ID: 4, AKEncrypted: ak}, SKEncrypted: sk}}
+	syncer := Syncer{Config: config.Config{RegionEndpoint: server.URL, RegionListPath: "/regions", ECSEndpoint: server.URL, ECSListPath: "/ecs", OpenAPITimeout: time.Second}, Keys: keys, Store: store}
+	count, err := syncer.SyncKind(context.Background(), store.account, "ecs", nil)
+	if err == nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	if store.replacements != 1 || len(store.writes) != 1 || len(store.regionSyncs) != 2 {
+		t.Fatalf("store=%#v", store)
+	}
+	if store.regionSyncs[0].Region != "allowed" || store.regionSyncs[0].Status != "success" || store.regionSyncs[1].Region != "denied" || store.regionSyncs[1].Status != "skipped" {
+		t.Fatalf("region syncs=%#v", store.regionSyncs)
+	}
 }
 
 func TestSyncECSAcrossPages(t *testing.T) {

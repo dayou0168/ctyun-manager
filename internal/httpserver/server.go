@@ -42,11 +42,15 @@ type ReadStore interface {
 
 type WriteStore interface {
 	AccountByID(context.Context, int64) (storage.AccountRecord, error)
+	Resources(context.Context, string, *int64) ([]storage.Resource, error)
 	CreateAccount(context.Context, storage.AccountWrite) (int64, error)
 	UpdateAccount(context.Context, int64, storage.AccountWrite) error
 	DeleteAccount(context.Context, int64) error
 	ResourceByProvider(context.Context, int64, string, string) (storage.Resource, error)
 	RecordOperation(context.Context, *int64, string, string, string, string, string) error
+	CreateActionJob(context.Context, storage.ActionJob) error
+	DueActionJobs(context.Context, int64, int) ([]storage.ActionJob, error)
+	UpdateActionJob(context.Context, string, string, string, int, int64) error
 }
 
 type Server struct {
@@ -609,7 +613,9 @@ func (s *Server) resources(w http.ResponseWriter, r *http.Request, _ security.Se
 			"id": row.ID, "account_id": row.AccountID, "resource_type": row.ResourceType,
 			"provider_id": row.ProviderID, "name": row.Name, "region": row.Region,
 			"status": row.Status, "billing_mode": row.BillingMode, "payload": payload,
-			"synced_at": row.SyncedAt,
+			"synced_at": row.SyncedAt, "sync_state": row.SyncState,
+			"last_seen_at": row.LastSeenAt, "last_success_at": row.LastSuccessAt,
+			"sync_error": row.SyncError,
 		})
 	}
 	writeJSON(w, http.StatusOK, result)

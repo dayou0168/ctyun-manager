@@ -15,6 +15,7 @@ on:
       - "go.sum"
       - "cmd/**"
       - "internal/**"
+      - "app/**"
       - "worker/**"
       - "start-go.sh"
       - "install-linux.sh"

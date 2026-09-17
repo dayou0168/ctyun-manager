@@ -60,6 +60,12 @@ func Normalize(item map[string]any, kind, scanRegion string, regionNames map[str
 			status = binding
 		}
 	}
+	if status == "" {
+		switch kind {
+		case "vpc", "subnet", "vip", "security_group", "route_table", "acl":
+			status = "available"
+		}
+	}
 	visibility := item["imageVisibilityCode"]
 	if empty(visibility) {
 		visibility = item["imageVisibility"]

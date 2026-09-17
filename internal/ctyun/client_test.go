@@ -87,3 +87,28 @@ func TestListAllIgnoresUnsupportedRegionsAndKeepsSupportedResults(t *testing.T) 
 		t.Fatalf("items=%#v", items)
 	}
 }
+
+func TestListAllDetailedReportsDeniedRegionSeparately(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["regionID"] == "denied" {
+			_, _ = w.Write([]byte(`{"statusCode":900,"message":"region is not allow to access"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"statusCode":800,"returnObj":{"totalCount":1,"results":[{"instanceID":"ecs-1"}]}}`))
+	}))
+	defer server.Close()
+	client := New("ak", "sk", time.Second)
+	regions, err := client.ListAllDetailed(context.Background(), ListRequest{
+		Endpoint: server.URL, Path: "/ecs", Method: http.MethodPost, ResourceType: "ecs",
+		RegionIDs: []string{"allowed", "denied"}, Paging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(regions) != 2 || regions[0].Status != "success" || len(regions[0].Items) != 1 || regions[1].Status != "skipped" {
+		t.Fatalf("regions=%#v", regions)
+	}
+}

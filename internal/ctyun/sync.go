@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -20,6 +21,7 @@ var SyncTypes = []string{"ecs", "eip", "vpc", "subnet", "vip", "image", "securit
 type SyncStore interface {
 	AccountByID(context.Context, int64) (storage.AccountRecord, error)
 	ReplaceResources(context.Context, int64, string, []string, []storage.ResourceWrite) error
+	RecordRegionSync(context.Context, storage.RegionSync) error
 	RecordOperation(context.Context, *int64, string, string, string, string, string) error
 }
 type Syncer struct {
@@ -78,7 +80,7 @@ func (s *Syncer) Sync(ctx context.Context, accountID int64, kinds, overrideRegio
 			defer lock.Unlock()
 			if e != nil {
 				result.Errors[kind] = e.Error()
-				result.Counts[kind] = 0
+				result.Counts[kind] = count
 				result.OK = false
 			} else {
 				result.Counts[kind] = count
@@ -158,7 +160,7 @@ func (s *Syncer) SyncKind(ctx context.Context, account storage.AccountRecord, ki
 		request.Endpoint = s.Config.IMSEndpoint
 		request.Path = s.Config.IMSListPath
 		request.Method = http.MethodGet
-		request.Variants = []map[string]any{{"imageVisibilityCode": 1}, {"imageVisibilityCode": 0}, {"imageVisibilityCode": 2}, {"imageType": "standard"}, {"imageType": "public"}, {"imageType": "private"}, {"imageType": "shared"}, {}}
+		request.Variants = []map[string]any{{"imageVisibilityCode": 1}, {"imageVisibilityCode": 0}, {"imageVisibilityCode": 2}}
 	case "security_group":
 		request.Endpoint = s.Config.VPCEndpoint
 		request.Path = "/v4/vpc/new-query-security-groups"
@@ -174,27 +176,44 @@ func (s *Syncer) SyncKind(ctx context.Context, account storage.AccountRecord, ki
 	default:
 		return 0, errors.New("不支持的同步类型")
 	}
-	raw, err := client.ListAll(ctx, request)
+	regionResults, err := client.ListAllDetailed(ctx, request)
 	if err != nil {
 		return 0, err
 	}
-	writes := make([]storage.ResourceWrite, 0, len(raw))
-	for _, item := range raw {
-		scanRegion := first(item["_scan_region"])
-		delete(item, "_scan_region")
-		normalized := Normalize(item, kind, scanRegion, regionNames)
-		id := first(normalized["id"])
-		if id == "" {
+	total := 0
+	problems := []string{}
+	for _, regionResult := range regionResults {
+		if regionResult.Status != "success" {
+			if recordErr := s.Store.RecordRegionSync(ctx, storage.RegionSync{AccountID: account.ID, ResourceType: kind, Region: regionResult.Region, Status: regionResult.Status, Error: regionResult.Error}); recordErr != nil {
+				return total, recordErr
+			}
+			problems = append(problems, fmt.Sprintf("%s %s: %s", regionResult.Region, regionResult.Status, regionResult.Error))
 			continue
 		}
-		payload, err := json.Marshal(normalized)
-		if err != nil {
-			return 0, err
+		writes := make([]storage.ResourceWrite, 0, len(regionResult.Items))
+		for _, item := range regionResult.Items {
+			delete(item, "_scan_region")
+			normalized := Normalize(item, kind, regionResult.Region, regionNames)
+			id := first(normalized["id"])
+			if id == "" {
+				continue
+			}
+			payload, marshalErr := json.Marshal(normalized)
+			if marshalErr != nil {
+				return total, marshalErr
+			}
+			writes = append(writes, storage.ResourceWrite{ProviderID: id, Name: first(normalized["name"], id), Region: regionResult.Region, Status: first(normalized["status"]), BillingMode: first(normalized["billing_mode"]), PayloadJSON: string(payload)})
 		}
-		writes = append(writes, storage.ResourceWrite{ProviderID: id, Name: first(normalized["name"], id), Region: first(normalized["region"], account.Region), Status: first(normalized["status"]), BillingMode: first(normalized["billing_mode"]), PayloadJSON: string(payload)})
+		if err = s.Store.ReplaceResources(ctx, account.ID, kind, []string{regionResult.Region}, writes); err != nil {
+			return total, err
+		}
+		if err = s.Store.RecordRegionSync(ctx, storage.RegionSync{AccountID: account.ID, ResourceType: kind, Region: regionResult.Region, Status: "success", ItemCount: len(writes)}); err != nil {
+			return total, err
+		}
+		total += len(writes)
 	}
-	if err = s.Store.ReplaceResources(ctx, account.ID, kind, regions, writes); err != nil {
-		return 0, err
+	if len(problems) > 0 {
+		return total, errors.New(strings.Join(problems, "；"))
 	}
-	return len(writes), nil
+	return total, nil
 }

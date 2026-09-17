@@ -20,3 +20,19 @@ func TestNormalizeImageVisibility(t *testing.T) {
 		t.Fatalf("visibility=%#v", got["visibility"])
 	}
 }
+
+func TestNormalizeNetworkDefaultsAndEIPBinding(t *testing.T) {
+	t.Parallel()
+	vpc := Normalize(map[string]any{"vpcID": "vpc-1"}, "vpc", "r1", nil)
+	if vpc["status"] != "available" {
+		t.Fatalf("vpc status=%#v", vpc["status"])
+	}
+	unbound := Normalize(map[string]any{"eipID": "eip-1", "bindStatus": "unbound", "status": "ACTIVE"}, "eip", "r1", nil)
+	if unbound["binding_status"] != "unbound" || unbound["status"] != "ACTIVE" {
+		t.Fatalf("unbound eip=%#v", unbound)
+	}
+	bound := Normalize(map[string]any{"eipID": "eip-2", "instanceID": "ecs-1", "status": "ACTIVE"}, "eip", "r1", nil)
+	if bound["binding_status"] != "bound" {
+		t.Fatalf("bound eip=%#v", bound)
+	}
+}

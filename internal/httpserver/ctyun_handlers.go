@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/dayou0168/ctyun-manager/internal/ctyun"
 	"github.com/dayou0168/ctyun-manager/internal/security"
 	"github.com/dayou0168/ctyun-manager/internal/storage"
@@ -81,8 +83,21 @@ func (s *Server) runAction(w http.ResponseWriter, r *http.Request, _ security.Se
 		return
 	}
 	raw, _ := json.Marshal(result)
-	s.recordOperation(r, id, body.ResourceType, body.ResourceID, body.Action, "success", string(raw))
-	result["post_sync"] = map[string]any{"queued": false, "message": "操作已提交，请刷新资源确认最终状态"}
+	s.recordOperation(r, id, body.ResourceType, body.ResourceID, body.Action, "submitted", string(raw))
+	payloadJSON, _ := json.Marshal(body.Payload)
+	jobID := uuid.NewString()
+	job := storage.ActionJob{
+		ID: jobID, AccountID: id, ResourceType: body.ResourceType, ResourceID: body.ResourceID,
+		Action: body.Action, Region: firstText(body.Payload, "regionID", "regionId", "region"),
+		PayloadJSON: string(payloadJSON), ResultJSON: string(raw), Status: "pending",
+		NextAttemptAt: time.Now().Add(2 * time.Second).Unix(),
+	}
+	if err := writer.CreateActionJob(r.Context(), job); err != nil {
+		s.logger.Error("resource_action_job_create_failed", "account_id", id, "resource_type", body.ResourceType, "action", body.Action, "error", err)
+		result["post_sync"] = map[string]any{"queued": false, "message": "操作已提交，但服务器未能创建状态确认任务"}
+	} else {
+		result["post_sync"] = map[string]any{"queued": true, "job_id": jobID, "message": "操作已提交，服务器正在确认官方最终状态"}
+	}
 	writeJSON(w, 200, result)
 }
 

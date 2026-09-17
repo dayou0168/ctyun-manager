@@ -204,6 +204,13 @@ type ListRequest struct {
 	Paging                               bool
 }
 
+type RegionListResult struct {
+	Region string
+	Status string
+	Items  []map[string]any
+	Error  string
+}
+
 func ParseRegionIDs(value string) []string {
 	for _, separator := range []string{"\r\n", "\n", "，", ";", "；"} {
 		value = strings.ReplaceAll(value, separator, ",")
@@ -218,6 +225,25 @@ func ParseRegionIDs(value string) []string {
 }
 
 func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string]any, error) {
+	regions, err := c.ListAllDetailed(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	result := []map[string]any{}
+	problems := []string{}
+	for _, region := range regions {
+		result = append(result, region.Items...)
+		if region.Status == "failed" {
+			problems = append(problems, region.Region+": "+region.Error)
+		}
+	}
+	if len(problems) > 0 {
+		return nil, errors.New(strings.Join(problems, "；"))
+	}
+	return result, nil
+}
+
+func (c *Client) ListAllDetailed(ctx context.Context, request ListRequest) ([]RegionListResult, error) {
 	if len(request.RegionIDs) == 0 {
 		return nil, errors.New("没有查询到可用资源池")
 	}
@@ -233,6 +259,7 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 		items      []map[string]any
 		successes  int
 		problems   []string
+		skipped    []string
 		incomplete bool
 	}
 	regionResults := make([]regionResult, len(request.RegionIDs))
@@ -273,7 +300,9 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 							}
 							data, err := c.Request(ctx, request.Endpoint, path, request.Method, params)
 							if err != nil {
-								if !unsupportedRegionError(err) {
+								if unsupportedRegionError(err) {
+									local.skipped = append(local.skipped, err.Error())
+								} else {
 									local.problems = append(local.problems, fmt.Sprintf("%s %s: %v", path, region, err))
 									local.incomplete = local.incomplete || page > 1
 								}
@@ -297,12 +326,17 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 							}
 							page++
 						}
+						if page > 200 && total > 200 {
+							local.incomplete = true
+							local.problems = append(local.problems, fmt.Sprintf("%s %s: 分页超过安全上限 200", path, region))
+						}
 					}
 				}
 				if local.successes > 0 && !local.incomplete {
 					// Paths and variants are compatibility alternatives. A successful
 					// response for this region supersedes earlier variant failures.
 					local.problems = nil
+					local.skipped = nil
 				}
 				regionResults[index] = local
 			}
@@ -316,12 +350,21 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("同步资源时请求被中止: %w", err)
 	}
-	result := []map[string]any{}
+	result := make([]RegionListResult, 0, len(regionResults))
 	seen := map[string]bool{}
-	problems := []string{}
 	for index, local := range regionResults {
 		region := request.RegionIDs[index]
-		problems = append(problems, local.problems...)
+		entry := RegionListResult{Region: region, Status: "success", Items: []map[string]any{}}
+		if len(local.problems) > 0 || local.incomplete {
+			entry.Status = "failed"
+			entry.Error = strings.Join(local.problems, "；")
+		} else if local.successes == 0 {
+			entry.Status = "skipped"
+			entry.Error = strings.Join(local.skipped, "；")
+			if entry.Error == "" {
+				entry.Error = "资源池没有返回可用响应"
+			}
+		}
 		for _, item := range local.items {
 			id := resourceID(item, request.ResourceType)
 			key := id + ":" + region
@@ -329,18 +372,20 @@ func (c *Client) ListAll(ctx context.Context, request ListRequest) ([]map[string
 				continue
 			}
 			seen[key] = true
-			result = append(result, item)
+			entry.Items = append(entry.Items, item)
 		}
-	}
-	if len(problems) > 0 {
-		return nil, errors.New(strings.Join(problems, "；"))
+		result = append(result, entry)
 	}
 	return result, nil
 }
 
 func unsupportedRegionError(err error) bool {
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "region is not supported") || strings.Contains(message, "region not supported")
+	return strings.Contains(message, "region is not supported") ||
+		strings.Contains(message, "region not supported") ||
+		strings.Contains(message, "region is not allow to access") ||
+		strings.Contains(message, "region is not allowed to access") ||
+		strings.Contains(message, "no permission for region")
 }
 
 func resourceID(item map[string]any, kind string) string {
@@ -406,10 +451,24 @@ func objectSlice(a []any) []map[string]any {
 func TotalPages(data map[string]any) int {
 	for _, v := range []any{data, data["returnObj"], data["data"]} {
 		if m, ok := v.(map[string]any); ok {
-			for _, k := range []string{"totalPage", "totalPages"} {
+			for _, k := range []string{"totalPage", "totalPages", "pageCount", "pages"} {
 				if n := textValue(m[k]); n != "" {
 					if parsed, e := strconv.Atoi(n); e == nil && parsed > 0 {
 						return parsed
+					}
+				}
+			}
+			for _, k := range []string{"totalCount", "total", "count"} {
+				if n := textValue(m[k]); n != "" {
+					if parsed, e := strconv.Atoi(n); e == nil && parsed > 0 {
+						pageSize := 50
+						for _, sizeKey := range []string{"pageSize", "size", "limit"} {
+							if size, sizeErr := strconv.Atoi(textValue(m[sizeKey])); sizeErr == nil && size > 0 {
+								pageSize = size
+								break
+							}
+						}
+						return (parsed + pageSize - 1) / pageSize
 					}
 				}
 			}

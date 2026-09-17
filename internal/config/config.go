@@ -68,7 +68,7 @@ func Load() (Config, error) {
 		SessionSecret:           envText("CTYUN_MANAGER_SESSION_SECRET", "change-this-session-secret"),
 		ConfiguredKey:           envText("CTYUN_MANAGER_MASTER_KEY", ""),
 		PublicURL:               envText("CTYUN_MANAGER_PUBLIC_URL", "http://127.0.0.1:8000"),
-		BackgroundSyncEnabled:   envBool("CTYUN_BACKGROUND_SYNC_ENABLED", false),
+		BackgroundSyncEnabled:   envBool("CTYUN_BACKGROUND_SYNC_ENABLED", true),
 		BackgroundSyncInterval:  time.Duration(envInt("CTYUN_BACKGROUND_SYNC_SECONDS", 1800, 60, 86400)) * time.Second,
 		FinanceRefreshEnabled:   envBool("CTYUN_FINANCE_REFRESH_ENABLED", true),
 		FinanceRefreshInterval:  time.Duration(envInt("CTYUN_FINANCE_REFRESH_SECONDS", 1800, 60, 86400)) * time.Second,

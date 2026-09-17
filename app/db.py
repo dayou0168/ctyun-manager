@@ -55,7 +55,40 @@ def migrate() -> None:
               billing_mode text not null default '',
               payload_json text not null default '{}',
               synced_at text not null default current_timestamp,
+              sync_state text not null default 'stale',
+              last_seen_at text,
+              last_success_at text,
+              sync_error text not null default '',
               unique(account_id, resource_type, provider_id)
+            );
+
+            create table if not exists resource_sync_regions (
+              account_id integer not null,
+              resource_type text not null,
+              region text not null,
+              status text not null,
+              item_count integer not null default 0,
+              error text not null default '',
+              last_attempt_at text not null default current_timestamp,
+              last_success_at text,
+              primary key(account_id, resource_type, region)
+            );
+
+            create table if not exists resource_action_jobs (
+              id text primary key,
+              account_id integer not null,
+              resource_type text not null,
+              resource_id text not null default '',
+              action text not null,
+              region text not null default '',
+              payload_json text not null default '{}',
+              result_json text not null default '{}',
+              status text not null default 'pending',
+              attempts integer not null default 0,
+              next_attempt_at integer not null,
+              last_error text not null default '',
+              created_at text not null default current_timestamp,
+              updated_at text not null default current_timestamp
             );
 
             create table if not exists operations (
@@ -134,6 +167,27 @@ def migrate() -> None:
         columns = [row["name"] for row in conn.execute("pragma table_info(ctyun_accounts)").fetchall()]
         if "provider_account_id" not in columns:
             conn.execute("alter table ctyun_accounts add column provider_account_id text not null default ''")
+        resource_columns = {row["name"] for row in conn.execute("pragma table_info(resources)").fetchall()}
+        for column, definition in (
+            ("sync_state", "text not null default 'stale'"),
+            ("last_seen_at", "text"),
+            ("last_success_at", "text"),
+            ("sync_error", "text not null default ''"),
+        ):
+            if column not in resource_columns:
+                conn.execute(f"alter table resources add column {column} {definition}")
+        conn.execute(
+            "create index if not exists idx_resources_type_account_region_sync "
+            "on resources(resource_type, account_id, region, sync_state, synced_at)"
+        )
+        conn.execute(
+            "create index if not exists idx_resource_jobs_due "
+            "on resource_action_jobs(status, next_attempt_at)"
+        )
+        conn.execute(
+            "create index if not exists idx_operations_action_account_id "
+            "on operations(action, account_id, id)"
+        )
         existing = conn.execute("select id from users where username = ?", (settings.admin_user,)).fetchone()
         if not existing:
             conn.execute(

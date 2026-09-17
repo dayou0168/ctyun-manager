@@ -562,13 +562,21 @@ function status(value, label = "", title = "") {
   return `<span class="status ${escapeHtml(statusKey(value))}"${tooltip ? ` title="${escapeHtml(tooltip)}"` : ""}>${escapeHtml(display)}</span>`;
 }
 
-function resourceStatus(row = {}) {
+function resourceStatus(row = {}, resourceType = row.resource_type || "") {
   const payload = row.payload || {};
-  return status(
-    row.status || payload.status,
-    payload.pendingActionLabel || "",
+  const isEip = resourceType === "eip";
+  const value = isEip ? (payload.binding_status || row.status || payload.status) : (row.status || payload.status);
+  const label = isEip && payload.binding_status === "bound"
+    ? "已绑定"
+    : (isEip && payload.binding_status === "unbound" ? "未绑定" : (payload.pendingActionLabel || ""));
+  const current = status(
+    value,
+    label,
     payload.pendingActionReason || ""
   );
+  if (row.sync_state !== "stale") return current;
+  const detail = row.sync_error || "最近一次同步未能确认该资源，当前展示的是缓存数据";
+  return `${current}<span class="status stale" title="${escapeHtml(detail)}">缓存已过期</span>`;
 }
 
 function resourceDomKey(type, accountId, resourceId) {
@@ -682,6 +690,8 @@ async function renderDashboard(seq = state.renderSeq) {
   if (!isActiveRender(seq)) return;
   const balances = summary.finance || [];
   const counts = summary.resource_counts || {};
+  const staleCounts = summary.stale_resource_counts || {};
+  const countMetric = (type) => `${counts[type] || 0}${staleCounts[type] ? `<small class="metric-stale" title="这些资源未被最近一次成功同步确认">另有 ${staleCounts[type]} 条过期缓存</small>` : ""}`;
   const balanceByAccount = new Map(balances.map((item) => [Number(item.account_id), item]));
   const hasBalance = (item) => item?.available !== null
     && item?.available !== undefined
@@ -696,8 +706,8 @@ async function renderDashboard(seq = state.renderSeq) {
   content.innerHTML = `
     <div class="metric-grid">
       <div class="metric"><small>云账号</small><strong>${summary.account_count ?? state.accounts.length}</strong></div>
-      <div class="metric"><small>云主机</small><strong>${counts.ecs || 0}</strong></div>
-      <div class="metric"><small>弹性 IP</small><strong>${counts.eip || 0}</strong></div>
+      <div class="metric"><small>云主机（已确认）</small><strong>${countMetric("ecs")}</strong></div>
+      <div class="metric"><small>弹性 IP（已确认）</small><strong>${countMetric("eip")}</strong></div>
       <div class="metric"><small>账户余额合计</small><strong>${balanceText}</strong></div>
     </div>
     ${panel("账号概览", state.accounts.length ? `<table><thead><tr><th>账号</th><th>区域</th><th>API</th><th>2FA</th><th>余额</th><th>操作</th></tr></thead><tbody>${state.accounts.map((a) => `<tr><td><strong>${escapeHtml(a.name)}</strong></td><td>${escapeHtml(a.region || "全部资源池")}</td><td>${a.ak_masked || "-"}</td><td>${a.has_totp ? "已配置" : "未配置"}</td><td>${formatBalance(balanceByAccount.get(a.id))}</td><td class="actions"><button data-console="${a.id}">官方控制台</button><button data-balance="${a.id}">刷新余额</button><button data-recharge="${a.id}">充值</button><button data-sync="${a.id}">同步</button></td></tr>`).join("")}</tbody></table>` : `<div class="empty">先添加一个完整的天翼云账号</div>`)}
@@ -1076,7 +1086,7 @@ async function renderImages(seq = state.renderSeq) {
           return `<tr>
             <td><strong>${escapeHtml(row.name)}</strong><br><span class="muted">${escapeHtml(row.provider_id)}</span></td>
             <td>${escapeHtml(accountName(row.account_id))}</td>
-            <td>${resourceStatus(row)}</td>
+            <td>${resourceStatus(row, "image")}</td>
             <td>${escapeHtml(row.payload.os || row.payload.osDistro || row.payload.osVersion || "-")}</td>
             <td>${escapeHtml(imageSourceTargetText(row))}</td>
             <td><div class="actions">${actions}</div></td>
@@ -1199,13 +1209,11 @@ function resourceSummaryFields(type, row) {
 function resourceCardsHtml(type, rows, scope, actionAttrs = () => "") {
   if (!["ecs", "eip"].includes(type)) return "";
   return `<div class="resource-card-list">${rows.map((row) => {
-    const stateValue = row.status || row.payload.instanceStatus;
-    const stateLabel = type === "ecs" ? ecsStatusLabel(stateValue) : statusLabel(stateValue);
     return `<article class="resource-card">
       <div class="resource-card-top">
         ${bulkableResourceTypes.has(type) ? `<input type="checkbox" class="resource-card-check" ${bulkSelectionAttrs(type, row, scope)}>` : ""}
         <div class="resource-card-title"><strong>${escapeHtml(row.name)}</strong><span>${escapeHtml(row.provider_id)}</span></div>
-        ${status(stateValue, stateLabel)}
+        ${resourceStatus(row, type)}
       </div>
       <div class="resource-card-meta">${resourceSummaryFields(type, row).map(([label, value]) => `<div><small>${escapeHtml(label)}</small><b>${escapeHtml(value)}</b></div>`).join("")}</div>
       <div class="resource-card-actions actions resource-actions">${renderResourceActions(type, row, actionAttrs(row))}</div>
@@ -1255,7 +1263,7 @@ async function renderResources(type, seq = state.renderSeq) {
       const bulkScope = `${type}:${accountId}:${key}`;
       return regionGroup(group.label, group.rows.length, `
         <div class="table-wrap resource-table"><table><thead><tr>${bulkSelectHeader(type, bulkScope)}<th>名称</th><th>状态</th>${extraHeaders}<th>操作</th></tr></thead><tbody>${group.rows.map((r) => `
-          <tr ${resourceRowAttrs(type, r)}>${bulkSelectCell(type, r, bulkScope)}<td><strong>${escapeHtml(r.name)}</strong><br><span class="muted">${escapeHtml(r.provider_id)}</span></td><td data-resource-status>${type === "ecs" ? status(r.status || r.payload.instanceStatus, ecsStatusLabel(r.status || r.payload.instanceStatus), r.payload.pendingActionReason || "") : resourceStatus(r)}</td>${extraCells(r)}<td><div class="actions resource-actions">${renderResourceActions(type, r, ecsNetworkAttrs(r))}</div></td></tr>`).join("")}</tbody></table></div>
+          <tr ${resourceRowAttrs(type, r)}>${bulkSelectCell(type, r, bulkScope)}<td><strong>${escapeHtml(r.name)}</strong><br><span class="muted">${escapeHtml(r.provider_id)}</span></td><td data-resource-status>${resourceStatus(r, type)}</td>${extraCells(r)}<td><div class="actions resource-actions">${renderResourceActions(type, r, ecsNetworkAttrs(r))}</div></td></tr>`).join("")}</tbody></table></div>
         ${resourceCardsHtml(type, group.rows, bulkScope, ecsNetworkAttrs)}
       `, `${accountId}:${key}`);
     }).join("");
@@ -5382,6 +5390,9 @@ async function syncTypesForAccounts(types, accountId = 0, silent = true, options
           Object.entries(result?.counts || {}).forEach(([type, count]) => {
             counts[type] = (counts[type] || 0) + Number(count || 0);
           });
+          Object.entries(result?.errors || {}).forEach(([type, message]) => {
+            errors.push(`${accountName(id)} ${resourceTypeLabel(type)}: ${message}`);
+          });
         } catch (error) {
           errors.push(`${accountName(id)}: ${error.message}`);
         }
@@ -5390,6 +5401,7 @@ async function syncTypesForAccounts(types, accountId = 0, silent = true, options
     state.lastRefreshAt = Date.now();
     state.lastSyncByScope.set(scopeKey, state.lastRefreshAt);
     clearResourceData(types, accountId || 0);
+    clearApiCache("/api/dashboard/summary");
     if (errors.length && !silent) toast(errors[0]);
     return { ok: !errors.length, counts, errors };
   } finally {
@@ -5765,8 +5777,9 @@ function postActionCheckState(check = {}, row = null) {
       : { state: "pending", reason: "弹性 IP 仍有绑定关系" };
   }
   if (check.resourceType === "eip" && action === "bind") {
-    const hasTarget = rowHasExpectedBinding(row, ["associationID", "associationId", "association_id", "instanceID", "instanceId", "deviceID", "deviceId"], check.match?.associationID);
-    return (rowHasEipBinding(row) && hasTarget) || /bound|binded|attached|associated|in[-_ ]?use|using|used|使用|绑定/.test(official)
+    const expected = check.match?.associationID;
+    const hasTarget = !expected || rowHasExpectedBinding(row, ["associationID", "associationId", "association_id", "instanceID", "instanceId", "deviceID", "deviceId"], expected);
+    return rowHasEipBinding(row) && hasTarget
       ? { state: "completed", reason: "弹性 IP 已绑定" }
       : { state: "pending", reason: "弹性 IP 尚未出现绑定关系" };
   }
@@ -6084,6 +6097,12 @@ function resourceOfficialStatus(row = {}) {
 
 function rowHasEipBinding(row = {}) {
   const payload = row.payload || {};
+  const normalized = String(payload.binding_status || "").trim().toLowerCase();
+  if (normalized === "unbound") return false;
+  if (normalized === "bound") return true;
+  const rawBindingStatus = String(payload.bindStatus || payload.bind_status || "").trim().toLowerCase();
+  if (/^(unbound|unbind|detached|free|idle|available|0|false)$/.test(rawBindingStatus)) return false;
+  if (/^(bound|binded|attached|associated|in[-_ ]?use|using|used|1|true)$/.test(rawBindingStatus)) return true;
   const values = [
     payload.associationID,
     payload.associationId,
@@ -6100,8 +6119,6 @@ function rowHasEipBinding(row = {}) {
     payload.deviceId,
     payload.bindID,
     payload.bindId,
-    payload.bindStatus,
-    payload.bind_status,
     payload.bound_instances,
   ];
   return values.some((value) => {
@@ -6324,7 +6341,7 @@ function optimisticActionSettled(override, row = {}) {
     return /free|unbound|unbind|detach|idle|available|未绑定|空闲/.test(official) || !rowHasEipBinding(row);
   }
   if (override.resourceType === "eip" && override.action === "bind") {
-    return /bound|binded|attached|associated|in[-_ ]?use|using|used|使用|绑定/.test(official) || rowHasEipBinding(row);
+    return rowHasEipBinding(row);
   }
   if (override.resourceType === "vip" && override.action === "bind_ecs") return rowHasVipEcsBinding(row);
   if (override.resourceType === "vip" && override.action === "bind_eip") return rowHasVipEipBinding(row);
