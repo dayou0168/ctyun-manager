@@ -184,7 +184,13 @@ func open(path string, readOnly bool) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite database: %w", err)
 	}
-	db.SetMaxOpenConns(4)
+	// SQLite permits many readers but only one writer. Resource synchronization
+	// deliberately fetches several resource types in parallel and each result is
+	// committed in a short transaction. Keeping a single pooled connection makes
+	// those commits queue in database/sql instead of racing into SQLITE_BUSY.
+	// It also ensures connection-scoped pragmas below apply to every operation.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	store := &Store{db: db}
 	if err := store.Ping(context.Background()); err != nil {
 		db.Close()

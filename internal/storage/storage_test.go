@@ -58,6 +58,9 @@ func TestOpenReadOnlyAndQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("SQLite pool max connections = %d, want 1", got)
+	}
 	user, err := store.UserByUsername(context.Background(), "admin")
 	if err != nil || user.PasswordHash != "hash" {
 		t.Fatalf("user = %#v, err = %v", user, err)
