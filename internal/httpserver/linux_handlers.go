@@ -189,24 +189,19 @@ func (s *Server) acceptLinuxFingerprint(w http.ResponseWriter, r *http.Request, 
 	}
 	previous := row.Fingerprint
 	cfg.ExpectedFingerprint = ""
-	conn, err := sshmanager.Connect(r.Context(), cfg, 10*time.Second)
+	fingerprint, err := sshmanager.ProbeFingerprint(r.Context(), cfg, 10*time.Second)
 	if err != nil {
 		s.linuxFailed(r, store, row, err)
-		writeDetail(w, 502, "验证新主机指纹时 SSH 认证失败："+err.Error())
+		writeDetail(w, 502, "读取新 SSH 主机指纹失败："+err.Error())
 		return
 	}
-	defer conn.Close()
-	if conn.Fingerprint == "" {
-		writeDetail(w, 502, "SSH 服务器没有返回可保存的主机指纹")
-		return
-	}
-	message := "已由用户确认并更新 SSH 主机指纹"
-	if err = store.UpdateLinuxStatus(r.Context(), row.ID, "ready", message, conn.Fingerprint); err != nil {
+	message := "已确认并更新 SSH 主机指纹，请重新测试 SSH 登录"
+	if err = store.UpdateLinuxStatus(r.Context(), row.ID, "unknown", message, fingerprint); err != nil {
 		s.internalStoreError(w, "linux_fingerprint_update_failed", err)
 		return
 	}
-	_ = store.RecordOperation(r.Context(), nil, "linux", fmt.Sprint(row.ID), "accept_host_fingerprint", "success", bounded(previous+" -> "+conn.Fingerprint, 500))
-	writeJSON(w, 200, map[string]any{"ok": true, "previous_fingerprint": previous, "fingerprint": conn.Fingerprint, "message": message})
+	_ = store.RecordOperation(r.Context(), nil, "linux", fmt.Sprint(row.ID), "accept_host_fingerprint", "success", bounded(previous+" -> "+fingerprint, 500))
+	writeJSON(w, 200, map[string]any{"ok": true, "previous_fingerprint": previous, "fingerprint": fingerprint, "message": message})
 }
 func (s *Server) linuxCommand(w http.ResponseWriter, r *http.Request, _ security.Session) {
 	store, row, cfg, ok := s.linuxConnection(w, r)

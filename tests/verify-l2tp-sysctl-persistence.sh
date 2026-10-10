@@ -7,6 +7,8 @@ installer="$repo_dir/install-l2tp-server.sh"
 grep -Fq 'L2TP_SYSCTL_FILE=/etc/sysctl.d/zz-l2tp-vpn.conf' "$installer"
 grep -Fq 'sysctl -p "$L2TP_SYSCTL_FILE" >/dev/null' "$installer"
 grep -Fq 'sysctl -w "net.ipv4.conf.${VPN_IFACE}.rp_filter=0"' "$installer"
+grep -Fq 'sysctl -w "net.ipv4.conf.${iface}.rp_filter=0"' "$installer"
+grep -Fq 'After=network-online.target NetworkManager-wait-online.service cloud-final.service firewalld.service' "$installer"
 
 calls="$(grep -Fc 'apply_kernel_network_settings' "$installer")"
 if [ "$calls" -lt 2 ]; then

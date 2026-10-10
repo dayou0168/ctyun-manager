@@ -3858,7 +3858,7 @@ function renderLinuxWorkspace(servers = [], selected = null) {
       <button class="linux-server-main" type="button" data-linux-select="${server.id}">
         <span class="linux-server-title">
           <strong>${escapeHtml(server.name)}</strong>
-          ${connected ? `<span class="status success">会话中</span>` : status(server.last_status || server.status)}
+          ${connected ? `<span class="status success">会话中</span>` : status(server.last_status || "unknown")}
         </span>
         <span class="linux-server-host">${escapeHtml(server.host)}:${server.port}</span>
         <span class="linux-server-meta">

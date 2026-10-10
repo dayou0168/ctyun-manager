@@ -2705,6 +2705,15 @@ peer="${PEERNAME:-}"
 [ -n "$peer" ] || exit 0
 [ -r "$USER_MAP_PATH" ] || exit 0
 
+# CTyunOS can restore forwarding and strict reverse-path filtering after the
+# boot helper has completed. Reapply them at the point a PPP session comes up,
+# which guarantees that a successfully dialed client can actually forward.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || logger -t l2tp-vpn "Failed to enable IPv4 forwarding"
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${VPN_IFACE}.rp_filter=0" >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
+
 line="$(awk -F '\t' -v user="$peer" '$1 == user {print; exit}' "$USER_MAP_PATH")"
 [ -n "$line" ] || exit 0
 
@@ -3081,7 +3090,7 @@ EOF
 [Unit]
 Description=Apply L2TP VIP and per-user egress rules
 Wants=network-online.target
-After=network-online.target firewalld.service
+After=network-online.target NetworkManager-wait-online.service cloud-final.service firewalld.service
 Before=strongswan.service strongswan-starter.service xl2tpd.service $XL2TPD_MULTI_SERVICE
 
 [Service]

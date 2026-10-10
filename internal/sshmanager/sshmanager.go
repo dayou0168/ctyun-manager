@@ -97,6 +97,50 @@ func HostFingerprint(key ssh.PublicKey) string {
 	return key.Type() + " " + ssh.FingerprintSHA256(key)
 }
 
+// ProbeFingerprint reads the live SSH host key without requiring successful
+// user authentication. This is used only after the user explicitly confirms a
+// reported host-key change.
+func ProbeFingerprint(ctx context.Context, c Config, timeout time.Duration) (string, error) {
+	host, err := NormalizeHost(c.Host)
+	if err != nil {
+		return "", err
+	}
+	if c.Port < 1 || c.Port > 65535 {
+		return "", errors.New("SSH 端口必须在 1-65535 之间")
+	}
+	if strings.TrimSpace(c.Username) == "" {
+		return "", errors.New("请填写 SSH 登录账号")
+	}
+
+	fingerprint := ""
+	clientCfg := &ssh.ClientConfig{
+		User:    c.Username,
+		Timeout: timeout,
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			fingerprint = HostFingerprint(key)
+			return nil
+		},
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprint(c.Port)))
+	if err != nil {
+		return "", fmt.Errorf("SSH 连接失败: %w", err)
+	}
+	defer raw.Close()
+
+	cc, ch, reqs, handshakeErr := ssh.NewClientConn(raw, net.JoinHostPort(host, fmt.Sprint(c.Port)), clientCfg)
+	if handshakeErr == nil {
+		_ = ssh.NewClient(cc, ch, reqs).Close()
+	}
+	if fingerprint == "" {
+		if handshakeErr != nil {
+			return "", fmt.Errorf("读取 SSH 主机指纹失败: %w", handshakeErr)
+		}
+		return "", errors.New("SSH 服务器没有返回主机指纹")
+	}
+	return fingerprint, nil
+}
+
 func (c *Connection) Close() {
 	if c != nil && c.Client != nil {
 		_ = c.Client.Close()
